@@ -14,10 +14,13 @@ import android.view.WindowManager;
 
 import org.json.JSONObject;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import okhttp3.Call;
+import okhttp3.Callback;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -27,6 +30,9 @@ import okhttp3.WebSocketListener;
 public class MainActivity extends Activity {
     private static final String SERVICE_TYPE = "_halolink._tcp.";
     private static final String PREFS = "halolink";
+    private static final int PORT_START = 8765;
+    private static final int PORT_END = 8775;
+    private static final long POLL_INTERVAL_MS = 1500L;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean resolving = new AtomicBoolean(false);
@@ -38,6 +44,20 @@ public class MainActivity extends Activity {
     private WebSocket webSocket;
     private boolean discoveryRunning = false;
     private boolean destroyed = false;
+    private volatile int scanGeneration = 0;
+    private String activeHost = "";
+    private int activePort = 0;
+
+    private final Runnable pollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (destroyed) return;
+            if (!activeHost.isEmpty() && activePort > 0) {
+                pollCurrentState(activeHost, activePort);
+            }
+            handler.postDelayed(this, POLL_INTERVAL_MS);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -49,13 +69,14 @@ public class MainActivity extends Activity {
 
         httpClient = new OkHttpClient.Builder()
                 .pingInterval(20, TimeUnit.SECONDS)
-                .connectTimeout(4, TimeUnit.SECONDS)
+                .connectTimeout(3, TimeUnit.SECONDS)
+                .readTimeout(4, TimeUnit.SECONDS)
                 .build();
         nsdManager = (NsdManager) getSystemService(Context.NSD_SERVICE);
         acquireMulticastLock();
 
         haloView.setStatus("SEARCHING", "Searching...");
-        trySavedEndpointThenDiscover();
+        trySavedHostThenDiscover();
     }
 
     private void enterImmersiveMode() {
@@ -78,15 +99,11 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void trySavedEndpointThenDiscover() {
+    private void trySavedHostThenDiscover() {
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         String host = prefs.getString("host", "");
-        int port = prefs.getInt("port", 8765);
         if (!host.isEmpty()) {
-            connectWebSocket(host, port, true);
-            handler.postDelayed(() -> {
-                if (webSocket == null && !destroyed) startDiscovery();
-            }, 1800);
+            scanForBridge(host, true);
         } else {
             startDiscovery();
         }
@@ -94,7 +111,7 @@ public class MainActivity extends Activity {
 
     private synchronized void startDiscovery() {
         if (destroyed || discoveryRunning || nsdManager == null) return;
-        haloView.setStatus("SEARCHING", "Searching...");
+        runOnUiThread(() -> haloView.setStatus("SEARCHING", "Searching..."));
         discoveryListener = new NsdManager.DiscoveryListener() {
             @Override public void onDiscoveryStarted(String regType) { discoveryRunning = true; }
             @Override public void onServiceFound(NsdServiceInfo service) {
@@ -134,7 +151,7 @@ public class MainActivity extends Activity {
                     InetAddress host = serviceInfo.getHost();
                     if (host == null) return;
                     safeStopDiscovery();
-                    connectWebSocket(host.getHostAddress(), serviceInfo.getPort(), false);
+                    scanForBridge(host.getHostAddress(), false);
                 }
             });
         } catch (RuntimeException error) {
@@ -142,12 +159,59 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void connectWebSocket(String host, int port, boolean savedEndpoint) {
+    private void scanForBridge(String host, boolean fallBackToDiscovery) {
+        int generation = ++scanGeneration;
+        runOnUiThread(() -> haloView.setStatus("SEARCHING", "Finding Bridge..."));
+        probePort(host, PORT_START, generation, fallBackToDiscovery);
+    }
+
+    private void probePort(String host, int port, int generation, boolean fallBackToDiscovery) {
+        if (destroyed || generation != scanGeneration) return;
+        if (port > PORT_END) {
+            if (fallBackToDiscovery) runOnUiThread(this::startDiscovery);
+            else scheduleDiscoveryRetry();
+            return;
+        }
+
+        String url = "http://" + safeHost(host) + ":" + port + "/health";
+        Request request = new Request.Builder().url(url).build();
+        httpClient.newCall(request).enqueue(new Callback() {
+            @Override public void onFailure(Call call, IOException error) {
+                probePort(host, port + 1, generation, fallBackToDiscovery);
+            }
+
+            @Override public void onResponse(Call call, Response response) {
+                boolean verified = false;
+                try (Response ignored = response) {
+                    if (response.isSuccessful() && response.body() != null) {
+                        JSONObject json = new JSONObject(response.body().string());
+                        verified = json.optBoolean("ok") && "HaloLink".equals(json.optString("product"));
+                    }
+                } catch (Exception ignored) { }
+
+                if (destroyed || generation != scanGeneration) return;
+                if (verified) {
+                    connectWebSocket(host, port);
+                } else {
+                    probePort(host, port + 1, generation, fallBackToDiscovery);
+                }
+            }
+        });
+    }
+
+    private String safeHost(String host) {
+        return host.contains(":") && !host.startsWith("[") ? "[" + host + "]" : host;
+    }
+
+    private synchronized void connectWebSocket(String host, int port) {
         if (destroyed) return;
         closeSocket();
-        haloView.setStatus("CONNECTING", "Connecting...");
-        String safeHost = host.contains(":") && !host.startsWith("[") ? "[" + host + "]" : host;
-        String url = "ws://" + safeHost + ":" + port + "/ws/phone";
+        activeHost = host;
+        activePort = port;
+        runOnUiThread(() -> haloView.setStatus("CONNECTING", "Connecting..."));
+        startPolling();
+
+        String url = "ws://" + safeHost(host) + ":" + port + "/ws/phone";
         Request request = new Request.Builder().url(url).build();
         WebSocket candidate = httpClient.newWebSocket(request, new WebSocketListener() {
             @Override public void onOpen(WebSocket socket, Response response) {
@@ -155,17 +219,11 @@ public class MainActivity extends Activity {
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                         .putString("host", host).putInt("port", port).apply();
                 runOnUiThread(() -> haloView.setStatus("READY", "Ready"));
-                socket.send("{\"type\":\"hello\",\"role\":\"android\",\"version\":\"0.1.0\"}");
+                socket.send("{\"type\":\"hello\",\"role\":\"android\",\"version\":\"0.1.4\"}");
             }
 
             @Override public void onMessage(WebSocket socket, String text) {
-                try {
-                    JSONObject json = new JSONObject(text);
-                    if (!"status".equals(json.optString("type"))) return;
-                    String state = json.optString("state", "READY");
-                    String label = json.optString("label", state);
-                    runOnUiThread(() -> haloView.setStatus(state, label));
-                } catch (Exception ignored) { }
+                applyStatusPayload(text, false);
             }
 
             @Override public void onClosing(WebSocket socket, int code, String reason) {
@@ -174,25 +232,54 @@ public class MainActivity extends Activity {
 
             @Override public void onClosed(WebSocket socket, int code, String reason) {
                 if (webSocket == socket) webSocket = null;
-                scheduleReconnect();
+                scheduleReconnect(host);
             }
 
             @Override public void onFailure(WebSocket socket, Throwable error, Response response) {
                 if (webSocket == socket) webSocket = null;
-                if (savedEndpoint) {
-                    runOnUiThread(() -> startDiscovery());
-                } else {
-                    scheduleReconnect();
-                }
+                scheduleReconnect(host);
             }
         });
         webSocket = candidate;
     }
 
-    private void scheduleReconnect() {
+    private void applyStatusPayload(String text, boolean nestedState) {
+        try {
+            JSONObject json = new JSONObject(text);
+            JSONObject status = nestedState ? json.optJSONObject("state") : json;
+            if (status == null || !"status".equals(status.optString("type"))) return;
+            String state = status.optString("state", "READY");
+            String label = status.optString("label", state);
+            runOnUiThread(() -> haloView.setStatus(state, label));
+        } catch (Exception ignored) { }
+    }
+
+    private void startPolling() {
+        handler.removeCallbacks(pollRunnable);
+        handler.post(pollRunnable);
+    }
+
+    private void pollCurrentState(String host, int port) {
+        String url = "http://" + safeHost(host) + ":" + port + "/api/state";
+        Request request = new Request.Builder().url(url).build();
+        httpClient.newCall(request).enqueue(new Callback() {
+            @Override public void onFailure(Call call, IOException error) { }
+
+            @Override public void onResponse(Call call, Response response) {
+                try (Response ignored = response) {
+                    if (!response.isSuccessful() || response.body() == null) return;
+                    String text = response.body().string();
+                    if (!host.equals(activeHost) || port != activePort) return;
+                    applyStatusPayload(text, true);
+                } catch (Exception ignored) { }
+            }
+        });
+    }
+
+    private void scheduleReconnect(String host) {
         if (destroyed) return;
         runOnUiThread(() -> haloView.setStatus("SEARCHING", "Reconnecting..."));
-        handler.postDelayed(this::startDiscovery, 1500);
+        handler.postDelayed(() -> scanForBridge(host, true), 1800);
     }
 
     private void scheduleDiscoveryRetry() {
@@ -205,7 +292,7 @@ public class MainActivity extends Activity {
         discoveryRunning = false;
     }
 
-    private void closeSocket() {
+    private synchronized void closeSocket() {
         WebSocket socket = webSocket;
         webSocket = null;
         if (socket != null) socket.close(1000, "Reconnect");
@@ -220,11 +307,12 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         destroyed = true;
+        ++scanGeneration;
         safeStopDiscovery();
         closeSocket();
+        handler.removeCallbacksAndMessages(null);
         if (httpClient != null) httpClient.dispatcher().executorService().shutdown();
         if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
-        handler.removeCallbacksAndMessages(null);
         super.onDestroy();
     }
 }
