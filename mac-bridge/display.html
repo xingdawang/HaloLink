@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no"><meta name="theme-color" content="#000000"><title>HaloLink Display</title>
+<style>
+:root{--c:#bfc6cf;--a:.65}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body{display:grid;place-items:center}.wrap{text-align:center;transform:translateY(-2vh)}.ring{position:relative;width:min(70vw,70vh);height:min(70vw,70vh);border-radius:50%;border:clamp(8px,2.1vw,18px) solid color-mix(in srgb,var(--c) 28%,transparent);box-shadow:0 0 38px color-mix(in srgb,var(--c) 38%,transparent),inset 0 0 25px color-mix(in srgb,var(--c) 18%,transparent)}.ring:before{content:"";position:absolute;inset:calc(clamp(8px,2.1vw,18px)*-1);border-radius:50%;border:clamp(8px,2.1vw,18px) solid var(--c);opacity:var(--a);filter:drop-shadow(0 0 16px var(--c))}.rotating:before{border-color:transparent transparent var(--c) var(--c);animation:spin 1.5s linear infinite}.pulse:before{animation:pulse 1.7s ease-in-out infinite}.flash:before{animation:flash .48s steps(1) infinite}.icon{position:absolute;left:50%;top:36%;transform:translate(-50%,-50%);font-size:clamp(42px,11vw,92px);color:var(--c);text-shadow:0 0 18px var(--c)}h1{position:absolute;left:0;right:0;top:50%;margin:0;font-size:clamp(36px,9vw,76px)}p{position:absolute;left:0;right:0;top:65%;margin:0;color:#8c949f;font-size:clamp(17px,4vw,31px)}@keyframes spin{to{transform:rotate(360deg)}}@keyframes pulse{50%{opacity:.28;filter:drop-shadow(0 0 4px var(--c))}}@keyframes flash{50%{opacity:.2}}.hint{position:fixed;bottom:5vh;color:#6f7680;font-size:14px}
+</style></head><body><main class="wrap"><div id="ring" class="ring rotating"><div id="icon" class="icon"></div><h1 id="label">Connecting...</h1><p id="sub">Local network</p></div></main><div class="hint">HaloLink browser preview</div>
+<script>
+const ring=document.getElementById('ring'),label=document.getElementById('label'),sub=document.getElementById('sub'),icon=document.getElementById('icon');
+const states={READY:['#46be64','Ready','Connected',''],THINKING:['#ff4646','Thinking...','ChatGPT is thinking',''],WORKING:['#ff8b33','Working...','A tool is running',''],STREAMING:['#ff5546','Responding...','Response in progress',''],LISTENING:['#3f9cff','Listening...','Voice input active','≋'],COMPLETED:['#4ae868','Completed!','Response ready','✓'],ERROR:['#d552eb','Error','Check the browser','!'],SEARCHING:['#bec6d0','Searching...','Looking for your Mac',''],CONNECTING:['#bec6d0','Connecting...','Local network','']};
+function show(s,l){s=(s||'READY').toUpperCase();const v=states[s]||states.READY;document.documentElement.style.setProperty('--c',v[0]);label.textContent=l||v[1];sub.textContent=v[2];icon.textContent=v[3];ring.className='ring '+(['WORKING','STREAMING','SEARCHING','CONNECTING'].includes(s)?'rotating':(['THINKING','LISTENING'].includes(s)?'pulse':s==='ERROR'?'flash':''));}
+let retry=800,wsConnected=false,lastTimestamp='';
+function applyStatus(j){if(!j||j.type!=='status')return;if(j.timestamp&&lastTimestamp&&j.timestamp<lastTimestamp)return;lastTimestamp=j.timestamp||lastTimestamp;show(j.state,j.label);}
+async function pollState(){
+  if(wsConnected)return;
+  try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();applyStatus(j.state);}
+  catch{show('CONNECTING');}
+}
+function connect(){
+  const scheme=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${scheme}://${location.host}/ws/phone`);
+  ws.onopen=()=>{wsConnected=true;retry=800;sub.textContent='Live connection';};
+  ws.onmessage=e=>{try{applyStatus(JSON.parse(e.data))}catch{}};
+  ws.onclose=()=>{wsConnected=false;pollState();setTimeout(connect,retry=Math.min(retry*1.5,7000));};
+  ws.onerror=()=>ws.close();
+}
+pollState();setInterval(pollState,1500);connect();
+document.addEventListener('click',()=>document.documentElement.requestFullscreen?.());
+</script></body></html>

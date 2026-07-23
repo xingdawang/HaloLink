@@ -1,0 +1,21 @@
+# macOS Finder metadata
+.DS_Store
+
+# Local Python runtime and generated state
+mac-bridge/.venv/
+mac-bridge/__pycache__/
+mac-bridge/.halolink_port
+TEST_REPORT.md
+*.py[cod]
+
+# Android/Gradle local build state and generated packages
+.gradle/
+android-app/.gradle/
+android-app/**/build/
+*.apk
+
+# Editor and local environment files
+.idea/
+*.iml
+.env
+.env.*

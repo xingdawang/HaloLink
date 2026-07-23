@@ -1,0 +1,10 @@
+HALOLINK v0.1.2 — START HERE
+
+1. Mac: double-click mac-bridge/run_bridge.command
+2. Chrome: chrome://extensions -> Developer mode -> Load unpacked -> choose chrome-extension
+3. Fast phone test: open the LAN URL printed by Bridge, adding /display
+   Example: http://192.168.0.218:8765/display
+4. Android app: open android-app in Android Studio, or double-click android-app/build_apk.command after Android Studio is installed.
+5. Test animations: double-click mac-bridge/demo_states.command
+
+The project uses Wi-Fi/LAN auto-discovery. Bluetooth is not required.

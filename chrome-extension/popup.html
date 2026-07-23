@@ -1,0 +1,12 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="popup.css"></head>
+<body>
+  <header><div class="halo"></div><div><strong>HaloLink</strong><small>ChatGPT status bridge</small></div></header>
+  <section><span id="dot" class="dot"></span><span id="connection">Checking Bridge…</span></section>
+  <section class="state"><small>Latest state</small><strong id="state">—</strong><span id="time"></span></section>
+  <div class="tests">
+    <button data-state="THINKING">Thinking</button><button data-state="WORKING">Working</button>
+    <button data-state="COMPLETED">Completed</button><button data-state="ERROR">Error</button>
+  </div>
+  <p>Bridge: <code id="bridgeAddress">searching 8765–8775</code></p>
+  <script src="popup.js"></script>
+</body></html>

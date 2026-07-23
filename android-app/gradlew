@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+APP_HOME=$(cd "${0%/*}" && pwd -P)
+WRAPPER_JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+if [ ! -f "$WRAPPER_JAR" ]; then
+  echo "Downloading the official Gradle 9.3.0 wrapper..."
+  mkdir -p "$(dirname "$WRAPPER_JAR")"
+  curl -fL "https://raw.githubusercontent.com/gradle/gradle/v9.3.0/gradle/wrapper/gradle-wrapper.jar" -o "$WRAPPER_JAR"
+fi
+exec java -classpath "$WRAPPER_JAR" org.gradle.wrapper.GradleWrapperMain "$@"
