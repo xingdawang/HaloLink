@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-PORT_START = 8765
+PORT_START = 8766
 PORT_END = 8775
 
 
@@ -22,13 +22,12 @@ def is_halolink_bridge(port: int) -> bool:
     except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError):
         return False
 
-    # v0.1.2+ has an explicit product marker. Older HaloLink versions are
-    # accepted only when their health response has the expected structure.
-    if payload.get("product") == "HaloLink" and payload.get("ok") is True:
-        return True
     return (
         payload.get("ok") is True
+        and payload.get("product") == "HaloLink"
         and isinstance(payload.get("version"), str)
+        and isinstance(payload.get("pid"), int)
+        and payload.get("port") == port
         and isinstance(payload.get("state"), dict)
         and "browserClients" in payload
         and "phoneClients" in payload
@@ -61,7 +60,7 @@ def discover_port() -> int:
             return port
 
     raise SystemExit(
-        "HaloLink Bridge is not running on ports 8765-8775. "
+        "HaloLink Bridge is not running on ports 8766-8775. "
         "Start run_bridge.command first."
     )
 

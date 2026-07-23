@@ -30,4 +30,4 @@ if [ ! -f .venv/.halolink_deps_installed ]; then
   touch .venv/.halolink_deps_installed
 fi
 
-python bridge.py
+exec python -u bridge.py --port 8766 --port-end 8775

@@ -1,4 +1,4 @@
-const PORT_START = 8765;
+const PORT_START = 8766;
 const PORT_END = 8775;
 
 let socket = null;
@@ -8,10 +8,11 @@ let connectAttempt = 0;
 let lastStatus = { state: "READY", label: "Ready", timestamp: new Date().toISOString() };
 let bridgeConnected = false;
 let bridgePort = null;
+let bridgeInfo = null;
 let scanning = false;
 
 function saveSnapshot() {
-  chrome.storage.local.set({ bridgeConnected, bridgePort, lastStatus });
+  chrome.storage.local.set({ bridgeConnected, bridgePort, bridgeInfo, lastStatus });
 }
 
 function closeCurrentSocket() {
@@ -35,20 +36,31 @@ async function probePort(port) {
       cache: "no-store",
       signal: controller.signal
     });
-    if (!response.ok) return false;
+    if (!response.ok) return null;
     const payload = await response.json();
-    return payload?.ok === true && typeof payload?.version === "string";
+    if (
+      payload?.ok !== true ||
+      payload?.product !== "HaloLink" ||
+      typeof payload?.version !== "string" ||
+      !Number.isInteger(payload?.pid) ||
+      payload?.port !== port
+    ) return null;
+    return payload;
   } catch (_) {
-    return false;
+    return null;
   } finally {
     clearTimeout(timeout);
   }
 }
 
 async function discoverBridgePort() {
-  if (bridgePort && await probePort(bridgePort)) return bridgePort;
+  if (bridgePort) {
+    const payload = await probePort(bridgePort);
+    if (payload) return { port: bridgePort, payload };
+  }
   for (let port = PORT_START; port <= PORT_END; port += 1) {
-    if (await probePort(port)) return port;
+    const payload = await probePort(port);
+    if (payload) return { port, payload };
   }
   return null;
 }
@@ -58,20 +70,28 @@ async function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
   scanning = true;
   clearTimeout(retryTimer);
-  const port = await discoverBridgePort();
+  const discovered = await discoverBridgePort();
   scanning = false;
 
-  if (!port) {
+  if (!discovered) {
     bridgeConnected = false;
     bridgePort = null;
+    bridgeInfo = null;
     saveSnapshot();
     scheduleReconnect(Math.min(1500 + connectAttempt * 500, 8000));
     connectAttempt += 1;
     return;
   }
 
-  bridgePort = port;
-  const url = `ws://127.0.0.1:${port}/ws/browser`;
+  bridgePort = discovered.port;
+  bridgeInfo = {
+    pid: discovered.payload.pid,
+    port: discovered.payload.port,
+    version: discovered.payload.version,
+    state: discovered.payload.state,
+    phoneClients: discovered.payload.phoneClients
+  };
+  const url = `ws://127.0.0.1:${bridgePort}/ws/browser`;
   try {
     socket = new WebSocket(url);
   } catch (_) {
@@ -85,7 +105,7 @@ async function connect() {
     bridgeConnected = true;
     connectAttempt = 0;
     saveSnapshot();
-    sendRaw({ type: "hello", role: "browser-extension", version: "0.1.1" });
+    sendRaw({ type: "hello", role: "browser-extension", version: "0.1.3" });
     sendStatus(lastStatus);
     clearInterval(keepAliveTimer);
     keepAliveTimer = setInterval(() => {
@@ -104,6 +124,21 @@ async function connect() {
   socket.addEventListener("error", () => {
     bridgeConnected = false;
     saveSnapshot();
+  });
+
+  socket.addEventListener("message", event => {
+    try {
+      const message = JSON.parse(event.data);
+      if (message?.type === "hello" && message?.role === "bridge") {
+        bridgeInfo = {
+          ...(bridgeInfo || {}),
+          pid: message.pid,
+          port: message.port,
+          version: message.version
+        };
+        saveSnapshot();
+      }
+    } catch (_) { }
   });
 }
 
@@ -139,8 +174,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
   if (message?.type === "HALOLINK_GET_STATE") {
-    sendResponse({ bridgeConnected, bridgePort, lastStatus });
-    return;
+    (async () => {
+      if (bridgePort) {
+        const payload = await probePort(bridgePort);
+        if (payload) {
+          bridgeInfo = {
+            pid: payload.pid,
+            port: payload.port,
+            version: payload.version,
+            state: payload.state,
+            phoneClients: payload.phoneClients
+          };
+          saveSnapshot();
+        }
+      }
+      sendResponse({ bridgeConnected, bridgePort, bridgeInfo, lastStatus });
+    })();
+    return true;
   }
   if (message?.type === "HALOLINK_TEST") {
     sendStatus({ state: message.state, label: message.label || message.state });
