@@ -1,10 +1,12 @@
-HALOLINK v0.1.2 — START HERE
+HALOLINK v0.1.5 — START HERE
 
 1. Mac: double-click mac-bridge/run_bridge.command
 2. Chrome: chrome://extensions -> Developer mode -> Load unpacked -> choose chrome-extension
-3. Fast phone test: open the LAN URL printed by Bridge, adding /display
-   Example: http://192.168.0.218:8765/display
-4. Android app: open android-app in Android Studio, or double-click android-app/build_apk.command after Android Studio is installed.
+3. Android: install apk/HaloLink-v0.1.5-debug.apk and open HaloLink on the same Wi-Fi
+4. Confirm http://MAC_IP:PORT/health reports product=HaloLink and phoneClients=1
 5. Test animations: double-click mac-bridge/demo_states.command
+
+HaloLink prefers port 8766 and falls back through 8775. It does not use the
+Camera Activity Notifier service on 127.0.0.1:8765.
 
 The project uses Wi-Fi/LAN auto-discovery. Bluetooth is not required.

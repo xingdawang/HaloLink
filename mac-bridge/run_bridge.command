@@ -30,6 +30,6 @@ if [ ! -f .venv/.halolink_deps_installed ]; then
   touch .venv/.halolink_deps_installed
 fi
 
-# Port 8765 is reserved for camera-activity-notifier on this Mac.
-# HaloLink starts at 8766 and can still fall back through 8775.
-python bridge.py --port 8766 --port-end 8775
+# Port 8765 is reserved for Camera Activity Notifier.
+# HaloLink starts at 8766 and can fall back through 8775.
+exec python -u bridge.py --port 8766 --port-end 8775

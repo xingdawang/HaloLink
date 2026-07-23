@@ -15,6 +15,7 @@ cat > "$PLIST" <<EOF
 <key>Label</key><string>com.halolink.bridge</string>
 <key>ProgramArguments</key><array>
 <string>$BASE/.venv/bin/python</string>
+<string>-u</string>
 <string>$BASE/bridge.py</string>
 <string>--port</string><string>8766</string>
 <string>--port-end</string><string>8775</string>

@@ -7,7 +7,7 @@ echo
 
 echo "Processes listening on HaloLink ports:"
 found_listener=0
-for port in $(seq 8765 8775); do
+for port in $(seq 8766 8775); do
   line=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2)
   if [ -n "$line" ]; then
     found_listener=1
@@ -16,15 +16,15 @@ for port in $(seq 8765 8775); do
   fi
 done
 if [ "$found_listener" -eq 0 ]; then
-  echo "No process is listening on ports 8765-8775."
+  echo "No process is listening on ports 8766-8775."
 fi
 
 echo
 echo "HaloLink health check:"
 found_bridge=0
-for port in $(seq 8765 8775); do
+for port in $(seq 8766 8775); do
   result=$(curl -fsS --max-time 0.4 "http://127.0.0.1:$port/health" 2>/dev/null)
-  if echo "$result" | grep -q '"ok": true'; then
+  if echo "$result" | grep -q '"product": "HaloLink"'; then
     found_bridge=1
     echo "HaloLink is responding on port $port"
     echo "$result"

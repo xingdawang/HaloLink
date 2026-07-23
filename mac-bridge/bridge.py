@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import ipaddress
 import json
 import os
@@ -16,6 +17,8 @@ import re
 import signal
 import socket
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,11 +31,14 @@ except ImportError:
     IPVersion = ServiceInfo = Zeroconf = None  # type: ignore[assignment]
     ZEROCONF_AVAILABLE = False
 
-DEFAULT_PORT = int(os.environ.get("HALOLINK_PORT", "8765"))
+DEFAULT_PORT = int(os.environ.get("HALOLINK_PORT", "8766"))
 PORT_SCAN_END = int(os.environ.get("HALOLINK_PORT_END", "8775"))
 ACTIVE_PORT = DEFAULT_PORT
 SERVICE_TYPE = "_halolink._tcp.local."
-VERSION = "0.1.3"
+VERSION = "0.1.5"
+PROJECT_PATH = str(Path(__file__).resolve().parent.parent)
+LOCK_PATH = Path(__file__).with_name(".halolink.lock")
+LOCK_HANDLE = None
 
 PHONE_CLIENTS: set[web.WebSocketResponse] = set()
 BROWSER_CLIENTS: set[web.WebSocketResponse] = set()
@@ -53,6 +59,57 @@ CURRENT_STATE: dict[str, Any] = {
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def verified_bridge_health(port: int) -> dict[str, Any] | None:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/health", timeout=0.6
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        OSError,
+        urllib.error.URLError,
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+    ):
+        return None
+    if (
+        response.status == 200
+        and payload.get("ok") is True
+        and payload.get("product") == "HaloLink"
+    ):
+        return payload
+    return None
+
+
+def acquire_single_instance() -> bool:
+    """Hold an advisory lock for the lifetime of this Bridge process."""
+    global LOCK_HANDLE
+    LOCK_HANDLE = LOCK_PATH.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(LOCK_HANDLE.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        for port in range(DEFAULT_PORT, PORT_SCAN_END + 1):
+            health = verified_bridge_health(port)
+            if health:
+                print(
+                    "HaloLink Bridge is already running on port "
+                    f"{port} (PID {health.get('pid', 'unknown')})",
+                    flush=True,
+                )
+                return False
+        print(
+            f"HaloLink single-instance lock is held: {LOCK_PATH}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(3)
+    LOCK_HANDLE.seek(0)
+    LOCK_HANDLE.truncate()
+    LOCK_HANDLE.write(f"{os.getpid()}\n")
+    LOCK_HANDLE.flush()
+    return True
 
 
 def sanitize_hostname(value: str) -> str:
@@ -154,7 +211,13 @@ async def ws_browser(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
     BROWSER_CLIENTS.add(ws)
     print(f"Browser connected ({len(BROWSER_CLIENTS)} total)", flush=True)
-    await ws.send_json({"type": "hello", "role": "bridge", "version": VERSION})
+    await ws.send_json({
+        "type": "hello",
+        "role": "bridge",
+        "version": VERSION,
+        "pid": os.getpid(),
+        "port": ACTIVE_PORT,
+    })
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
@@ -181,7 +244,13 @@ async def ws_phone(request: web.Request) -> web.WebSocketResponse:
     PHONE_CLIENTS.add(ws)
     peer = request.transport.get_extra_info("peername") if request.transport else None
     print(f"Phone connected from {peer} ({len(PHONE_CLIENTS)} total)", flush=True)
-    await ws.send_json({"type": "hello", "role": "bridge", "version": VERSION})
+    await ws.send_json({
+        "type": "hello",
+        "role": "bridge",
+        "version": VERSION,
+        "pid": os.getpid(),
+        "port": ACTIVE_PORT,
+    })
     await ws.send_json(CURRENT_STATE)
     try:
         async for msg in ws:
@@ -205,6 +274,9 @@ async def health(_: web.Request) -> web.Response:
         "ok": True,
         "product": "HaloLink",
         "version": VERSION,
+        "pid": os.getpid(),
+        "projectPath": PROJECT_PATH,
+        "port": ACTIVE_PORT,
         "state": CURRENT_STATE,
         "browserClients": len(BROWSER_CLIENTS),
         "phoneClients": len(PHONE_CLIENTS),
@@ -218,6 +290,9 @@ async def current_state(_: web.Request) -> web.Response:
         "ok": True,
         "product": "HaloLink",
         "version": VERSION,
+        "pid": os.getpid(),
+        "projectPath": PROJECT_PATH,
+        "port": ACTIVE_PORT,
         "state": CURRENT_STATE,
         "phoneClients": len(PHONE_CLIENTS),
         "lastDelivery": LAST_DELIVERY,
@@ -248,7 +323,9 @@ async def index(_: web.Request) -> web.Response:
     html = f"""<!doctype html><meta charset='utf-8'><title>HaloLink Bridge</title>
     <style>body{{font:16px -apple-system,sans-serif;background:#080a0c;color:#eee;padding:36px}}
     code{{background:#171a1f;padding:3px 7px;border-radius:6px}}button{{margin:5px;padding:10px 14px}}</style>
-    <h1>HaloLink Bridge {VERSION}</h1><p>Current state: <code>{CURRENT_STATE['state']}</code></p>
+    <h1>HaloLink Bridge {VERSION}</h1>
+    <p>PID: <code>{os.getpid()}</code> · Port: <code>{ACTIVE_PORT}</code></p>
+    <p>Current state: <code>{CURRENT_STATE['state']}</code></p>
     <p>Browser clients: {len(BROWSER_CLIENTS)} · Phone clients: {len(PHONE_CLIENTS)}</p>
     <p>Test:</p><div id='buttons'></div><script>
     for(const s of ['READY','THINKING','WORKING','STREAMING','LISTENING','COMPLETED','ERROR']){{
@@ -266,12 +343,16 @@ def port_is_available(port: int) -> bool:
     via 127.0.0.1.  Probe both bindings without SO_REUSEADDR so a selected
     HaloLink port is unambiguous for the phone, health checks, and demo.
     """
-    for address in ("127.0.0.1", "0.0.0.0"):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            try:
-                sock.bind((address, port))
-            except OSError:
-                return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.15)
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            return False
     return True
 
 
@@ -339,19 +420,31 @@ async def main() -> None:
     zc = None
     info = None
     try:
-        zc, info = register_mdns(advertise_ip, ACTIVE_PORT)
+        zc, info = await asyncio.to_thread(
+            register_mdns, advertise_ip, ACTIVE_PORT
+        )
     except Exception as exc:  # mDNS failure should not prevent manual-IP testing.
-        print(f"Warning: mDNS registration failed: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"Warning: mDNS registration failed: {type(exc).__name__}: {exc!r}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     print("\nHaloLink Bridge", VERSION, flush=True)
     port_file = Path(__file__).with_name(".halolink_port")
     port_file.write_text(str(ACTIVE_PORT), encoding="utf-8")
     if ACTIVE_PORT != args.port:
         print(f"Port {args.port} was unavailable; using {ACTIVE_PORT} instead.", flush=True)
-    print(f"Listening: http://127.0.0.1:{ACTIVE_PORT}", flush=True)
+    print(f"Project path: {PROJECT_PATH}", flush=True)
+    print(f"PID: {os.getpid()}", flush=True)
+    print(f"Listening address: 0.0.0.0:{ACTIVE_PORT}", flush=True)
+    print(f"Selected port: {ACTIVE_PORT}", flush=True)
+    print(f"Local health: http://127.0.0.1:{ACTIVE_PORT}/health", flush=True)
     print(f"LAN address: http://{advertise_ip}:{ACTIVE_PORT}", flush=True)
     print(f"Phone display: http://{advertise_ip}:{ACTIVE_PORT}/display", flush=True)
     print(f"mDNS service: {SERVICE_TYPE}", flush=True)
+    print(f"Browser clients: {len(BROWSER_CLIENTS)}", flush=True)
+    print(f"Phone clients: {len(PHONE_CLIENTS)}", flush=True)
     print("Press Ctrl+C to stop.\n", flush=True)
 
     stop_event = asyncio.Event()
@@ -364,14 +457,16 @@ async def main() -> None:
     await stop_event.wait()
 
     if zc and info:
-        zc.unregister_service(info)
-        zc.close()
+        await asyncio.to_thread(zc.unregister_service, info)
+        await asyncio.to_thread(zc.close)
     for ws in list(PHONE_CLIENTS | BROWSER_CLIENTS):
         await ws.close(code=1001, message=b"Bridge shutting down")
     await runner.cleanup()
 
 
 if __name__ == "__main__":
+    if not acquire_single_instance():
+        raise SystemExit(0)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
