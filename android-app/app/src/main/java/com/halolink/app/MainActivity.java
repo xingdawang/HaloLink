@@ -45,6 +45,7 @@ public class MainActivity extends Activity {
     private WifiManager.MulticastLock multicastLock;
     private OkHttpClient httpClient;
     private WebSocket webSocket;
+    private Runnable reconnectRunnable;
     private boolean discoveryRunning = false;
     private boolean destroyed = false;
     private volatile int scanGeneration = 0;
@@ -291,6 +292,10 @@ public class MainActivity extends Activity {
 
     private synchronized void connectWebSocket(String host, int port) {
         if (destroyed) return;
+        if (reconnectRunnable != null) {
+            handler.removeCallbacks(reconnectRunnable);
+            reconnectRunnable = null;
+        }
         closeSocket();
         activeHost = host;
         activePort = port;
@@ -302,7 +307,13 @@ public class MainActivity extends Activity {
         Request request = new Request.Builder().url(url).build();
         WebSocket candidate = httpClient.newWebSocket(request, new WebSocketListener() {
             @Override public void onOpen(WebSocket socket, Response response) {
-                webSocket = socket;
+                synchronized (MainActivity.this) {
+                    if (destroyed || webSocket != socket) {
+                        socket.close(1000, "Superseded");
+                        Log.i(TAG, "ignoring superseded WebSocket open");
+                        return;
+                    }
+                }
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                         .putString("host", host).putInt("port", port).apply();
                 runOnUiThread(() -> haloView.setStatus("READY", "Ready"));
@@ -324,13 +335,21 @@ public class MainActivity extends Activity {
             }
 
             @Override public void onClosed(WebSocket socket, int code, String reason) {
-                if (webSocket == socket) webSocket = null;
+                boolean current;
+                synchronized (MainActivity.this) {
+                    current = webSocket == socket;
+                    if (current) webSocket = null;
+                }
                 Log.w(TAG, "WebSocket closed code=" + code + " reason=" + reason);
-                scheduleReconnect(host);
+                if (current) scheduleReconnect(host);
             }
 
             @Override public void onFailure(WebSocket socket, Throwable error, Response response) {
-                if (webSocket == socket) webSocket = null;
+                boolean current;
+                synchronized (MainActivity.this) {
+                    current = webSocket == socket;
+                    if (current) webSocket = null;
+                }
                 int status = response == null ? 0 : response.code();
                 Log.e(
                         TAG,
@@ -338,7 +357,7 @@ public class MainActivity extends Activity {
                                 + " httpStatus=" + status,
                         error
                 );
-                scheduleReconnect(host);
+                if (current) scheduleReconnect(host);
             }
         });
         webSocket = candidate;
@@ -393,11 +412,19 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void scheduleReconnect(String host) {
+    private synchronized void scheduleReconnect(String host) {
         if (destroyed) return;
+        if (reconnectRunnable != null) handler.removeCallbacks(reconnectRunnable);
         Log.i(TAG, "reconnect scheduled host=" + host + " delayMs=1800");
         runOnUiThread(() -> haloView.setStatus("SEARCHING", "Reconnecting..."));
-        handler.postDelayed(() -> scanForBridge(host, activePort, true), 1800);
+        int port = activePort;
+        reconnectRunnable = () -> {
+            synchronized (MainActivity.this) {
+                reconnectRunnable = null;
+            }
+            scanForBridge(host, port, true);
+        };
+        handler.postDelayed(reconnectRunnable, 1800);
     }
 
     private void scheduleDiscoveryRetry() {
@@ -429,6 +456,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         destroyed = true;
         ++scanGeneration;
+        reconnectRunnable = null;
         safeStopDiscovery();
         closeSocket();
         handler.removeCallbacksAndMessages(null);

@@ -18,6 +18,7 @@
   let sessionStartLength = 0;
   let lastAssistantLength = 0;
   let lastAssistantChangeAt = 0;
+  let streamingSeen = false;
   let lastState = "";
   let completionTimer = null;
   let evaluateTimer = null;
@@ -50,16 +51,22 @@
   function emit(state, reason = "") {
     if (state === lastState && state !== "STREAMING") return;
     lastState = state;
-    chrome.runtime.sendMessage({
-      type: "HALOLINK_STATUS",
-      payload: {
-        state,
-        label: statusLabel(state),
-        timestamp: new Date().toISOString(),
-        reason,
-        url: location.href
-      }
-    }).catch(() => {});
+    try {
+      if (!chrome.runtime?.id) return;
+      chrome.runtime.sendMessage({
+        type: "HALOLINK_STATUS",
+        payload: {
+          state,
+          label: statusLabel(state),
+          timestamp: new Date().toISOString(),
+          reason,
+          url: location.href
+        }
+      }).catch(() => {});
+    } catch {
+      // An unpacked extension reload invalidates the old content-script context.
+      // The next page refresh injects a fresh context.
+    }
   }
 
   function allButtons() {
@@ -104,7 +111,9 @@
   }
 
   function detectListening() {
-    const candidates = Array.from(document.querySelectorAll('button, [role="dialog"], [aria-label], [data-testid]')).filter(visible);
+    const candidates = Array.from(
+      document.querySelectorAll('[role="dialog"], [data-testid*="voice"], [data-testid*="dictation"]')
+    ).filter(visible);
     return candidates.some(node => matchesAny(descriptor(node), LISTENING_PATTERNS));
   }
 
@@ -119,6 +128,7 @@
     sessionStartLength = text.length;
     lastAssistantLength = text.length;
     lastAssistantChangeAt = Date.now();
+    streamingSeen = false;
     emit("THINKING", reason);
   }
 
@@ -156,8 +166,9 @@
       if (detectWorking()) {
         emit("WORKING", "tool activity text detected");
       } else if (text.length > sessionStartLength + 2 || Date.now() - lastAssistantChangeAt < 800) {
+        streamingSeen = true;
         emit("STREAMING", "assistant message changing");
-      } else {
+      } else if (!streamingSeen) {
         emit("THINKING", "generation active before text");
       }
       if (!stop) finishGeneration("stop control disappeared");

@@ -5,7 +5,7 @@
 mac-bridge/.venv/
 mac-bridge/__pycache__/
 mac-bridge/.halolink_port
-TEST_REPORT.md
+mac-bridge/.halolink.lock
 *.py[cod]
 
 # Android/Gradle local build state and generated packages
