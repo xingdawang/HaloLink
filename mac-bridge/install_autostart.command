@@ -14,7 +14,10 @@ cat > "$PLIST" <<EOF
 <plist version="1.0"><dict>
 <key>Label</key><string>com.halolink.bridge</string>
 <key>ProgramArguments</key><array>
-<string>$BASE/.venv/bin/python</string><string>$BASE/bridge.py</string>
+<string>$BASE/.venv/bin/python</string>
+<string>$BASE/bridge.py</string>
+<string>--port</string><string>8766</string>
+<string>--port-end</string><string>8775</string>
 </array>
 <key>WorkingDirectory</key><string>$BASE</string>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
@@ -24,4 +27,4 @@ cat > "$PLIST" <<EOF
 EOF
 launchctl bootout gui/$(id -u) "$PLIST" 2>/dev/null || true
 launchctl bootstrap gui/$(id -u) "$PLIST"
-echo "HaloLink Bridge will now start automatically."
+echo "HaloLink Bridge will now start automatically on ports 8766-8775."
