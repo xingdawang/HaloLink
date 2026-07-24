@@ -1,4 +1,7 @@
 (() => {
+  const detector = globalThis.HaloLinkDetector;
+  if (!detector) return;
+
   const STOP_PATTERNS = [
     "stop generating", "stop response", "stop", "停止生成", "停止回答", "停止",
     "arrêter", "detener", "beenden"
@@ -6,35 +9,68 @@
   const SEND_PATTERNS = ["send message", "send", "发送消息", "发送"];
   const ERROR_PATTERNS = [
     "something went wrong", "network error", "rate limit", "error generating response",
-    "an error occurred", "出了点问题", "网络错误", "请求过多", "发生错误"
+    "an error occurred", "there was an error", "connection interrupted", "tool failed",
+    "couldn't browse", "failed to read", "出了点问题", "网络错误", "请求过多",
+    "发生错误", "连接已中断", "工具运行失败", "读取失败"
   ];
   const LISTENING_PATTERNS = ["listening", "正在聆听", "正在听"];
-  const WORKING_PATTERNS = [
-    "searching the web", "browsing", "searching", "running code", "analyzing",
-    "using tool", "reading files", "正在搜索", "浏览网页", "运行代码", "分析中", "读取文件"
-  ];
+  const TURN_SELECTOR = '[data-testid^="conversation-turn"], article';
+  const ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]';
+  const ACTIVITY_SELECTOR = [
+    '[role="status"]',
+    '[role="progressbar"]',
+    '[aria-live="polite"]',
+    '[aria-live="assertive"]',
+    '[aria-busy="true"]',
+    '[data-state="loading"]',
+    '[data-state="pending"]',
+    '[data-state="running"]',
+    '[data-testid*="tool"]',
+    '[data-testid*="search"]',
+    '[data-testid*="browse"]',
+    '[data-testid*="research"]',
+    '[data-testid*="progress"]',
+    '[data-testid*="code"]'
+  ].join(",");
+
+  const WORKING_HOLD_MS = 650;
+  const STREAMING_RECENT_MS = 1000;
+  const COMPLETION_STABLE_MS = 1500;
+  const RECENT_ACTIVITY_MUTATION_MS = 3000;
 
   let generationActive = false;
-  let sessionStartLength = 0;
-  let lastAssistantLength = 0;
+  let generationStartedAt = 0;
+  let generationTurn = null;
+  let currentAssistant = null;
+  let lastAssistantSignature = "";
   let lastAssistantChangeAt = 0;
-  let streamingSeen = false;
+  let lastWorkingSeenAt = 0;
   let lastState = "";
   let completionTimer = null;
   let evaluateTimer = null;
+  let generationSequence = 0;
 
-  const normalize = value => String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
-  const visible = el => {
-    if (!el) return false;
+  const mutationTimes = new WeakMap();
+  const normalize = detector.normalize;
+  const matchesAny = (text, patterns) => patterns.some(pattern => normalize(text).includes(pattern));
+
+  function visible(el) {
+    if (!(el instanceof Element)) return false;
     const style = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
     return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-  };
-  const descriptor = el => normalize([
-    el.getAttribute?.("aria-label"), el.getAttribute?.("title"),
-    el.getAttribute?.("data-testid"), el.textContent
-  ].filter(Boolean).join(" "));
-  const matchesAny = (text, patterns) => patterns.some(pattern => text.includes(pattern));
+  }
+
+  function descriptor(el) {
+    if (!(el instanceof Element)) return "";
+    return normalize([
+      el.getAttribute("aria-label"),
+      el.getAttribute("title"),
+      el.getAttribute("data-testid"),
+      el.getAttribute("data-state"),
+      el.textContent
+    ].filter(Boolean).join(" "));
+  }
 
   function statusLabel(state) {
     return {
@@ -48,7 +84,7 @@
     }[state] || state;
   }
 
-  function emit(state, reason = "") {
+  function emit(state, reason = "", evidence = null) {
     if (state === lastState && state !== "STREAMING") return;
     lastState = state;
     try {
@@ -60,12 +96,16 @@
           label: statusLabel(state),
           timestamp: new Date().toISOString(),
           reason,
+          evidence: evidence ? {
+            source: evidence.source || "",
+            match: evidence.match || "",
+            selector: evidence.selector || ""
+          } : null,
           url: location.href
         }
       }).catch(() => {});
     } catch {
-      // An unpacked extension reload invalidates the old content-script context.
-      // The next page refresh injects a fresh context.
+      // Reloading an unpacked extension invalidates the old content-script context.
     }
   }
 
@@ -73,110 +113,261 @@
     return Array.from(document.querySelectorAll("button")).filter(visible);
   }
 
-  function hasStopButton() {
-    return allButtons().some(button =>
+  function stopButton() {
+    return allButtons().find(button =>
       button.matches('[data-testid="stop-button"], [data-testid*="stop"]') ||
       matchesAny(descriptor(button), STOP_PATTERNS)
-    );
+    ) || null;
+  }
+
+  function hasStopButton() {
+    return Boolean(stopButton());
   }
 
   function isSendControl(el) {
-    if (!el) return false;
-    const button = el.closest?.("button");
+    const button = el?.closest?.("button");
     if (!button) return false;
     return button.matches('[data-testid="send-button"], [data-testid="composer-submit-button"], [data-testid*="send"]') ||
       matchesAny(descriptor(button), SEND_PATTERNS);
   }
 
+  function conversationTurns() {
+    return Array.from(document.querySelectorAll(TURN_SELECTOR)).filter(visible);
+  }
+
+  function latestConversationTurn() {
+    const turns = conversationTurns();
+    return turns.length ? turns[turns.length - 1] : null;
+  }
+
   function lastAssistantElement() {
-    const exact = document.querySelectorAll('[data-message-author-role="assistant"]');
+    const exact = Array.from(document.querySelectorAll(ASSISTANT_SELECTOR)).filter(visible);
     if (exact.length) return exact[exact.length - 1];
-    const turns = Array.from(document.querySelectorAll('article, [data-testid^="conversation-turn"]'));
-    return turns.reverse().find(el => matchesAny(descriptor(el), ["assistant", "chatgpt"])) || null;
+    return conversationTurns().reverse().find(el => matchesAny(descriptor(el), ["assistant", "chatgpt"])) || null;
   }
 
-  function assistantText() {
-    return normalize(lastAssistantElement()?.innerText || "");
+  function turnFor(el) {
+    return el?.closest?.(TURN_SELECTOR) || null;
   }
 
-  function activeRegionText() {
-    const assistant = lastAssistantElement();
-    if (!assistant) return "";
-    return normalize(assistant.innerText || assistant.textContent || "");
+  function assistantSignature(el) {
+    if (!el) return "";
+    const text = normalize(el.innerText || el.textContent || "");
+    const richNodes = el.querySelectorAll("pre, code, table, img, svg, a, blockquote").length;
+    return [text.length, text.slice(-160), richNodes, el.childElementCount].join(":");
+  }
+
+  function refreshAssistantTracking(now) {
+    const latest = lastAssistantElement();
+    if (latest !== currentAssistant) {
+      currentAssistant = latest;
+      lastAssistantSignature = assistantSignature(latest);
+      if (generationActive && latest) lastAssistantChangeAt = now;
+      const turn = turnFor(latest);
+      if (turn) generationTurn = turn;
+      return;
+    }
+
+    const signature = assistantSignature(latest);
+    if (signature !== lastAssistantSignature) {
+      lastAssistantSignature = signature;
+      lastAssistantChangeAt = now;
+    }
+  }
+
+  function markMutation(node, timestamp) {
+    let current = node instanceof Element ? node : node?.parentElement;
+    let depth = 0;
+    while (current && depth < 7) {
+      mutationTimes.set(current, timestamp);
+      if (current.matches?.(TURN_SELECTOR)) break;
+      current = current.parentElement;
+      depth += 1;
+    }
+  }
+
+  function recentlyMutated(el, now) {
+    return now - (mutationTimes.get(el) || 0) <= RECENT_ACTIVITY_MUTATION_MS;
+  }
+
+  function isWithinRelevantTurn(node, roots) {
+    return roots.some(root => root && (root === node || root.contains(node)));
+  }
+
+  function activityEvidenceFor(node, now, scoped) {
+    const result = detector.classifyActivityEvidence({
+      text: node.innerText || node.textContent || "",
+      ariaLabel: node.getAttribute("aria-label"),
+      title: node.getAttribute("title"),
+      testId: node.getAttribute("data-testid"),
+      dataState: node.getAttribute("data-state"),
+      className: typeof node.className === "string" ? node.className : "",
+      role: node.getAttribute("role"),
+      ariaLive: node.getAttribute("aria-live"),
+      ariaBusy: node.getAttribute("aria-busy"),
+      hasProgressbar: node.matches('[role="progressbar"]') || Boolean(node.querySelector('[role="progressbar"]')),
+      hasSpinner: Boolean(node.querySelector('[class*="spin"], [class*="loading"], [data-testid*="spinner"]')),
+      recentlyMutated: recentlyMutated(node, now)
+    });
+
+    if (!result.active) return null;
+    if (!scoped && !recentlyMutated(node, now)) return null;
+
+    return {
+      ...result,
+      selector: [
+        node.getAttribute("data-testid") ? `[data-testid="${node.getAttribute("data-testid")}"]` : "",
+        node.getAttribute("role") ? `[role="${node.getAttribute("role")}"]` : "",
+        node.getAttribute("aria-live") ? `[aria-live="${node.getAttribute("aria-live")}"]` : ""
+      ].filter(Boolean).join("") || node.tagName.toLowerCase()
+    };
+  }
+
+  function detectWorking(now) {
+    const latestTurn = latestConversationTurn();
+    const assistantTurn = turnFor(currentAssistant);
+    const roots = Array.from(new Set([generationTurn, assistantTurn, latestTurn].filter(Boolean)));
+    const candidates = new Set();
+
+    for (const root of roots) {
+      if (root.matches?.(ACTIVITY_SELECTOR)) candidates.add(root);
+      root.querySelectorAll?.(ACTIVITY_SELECTOR).forEach(node => candidates.add(node));
+      // New ChatGPT layouts sometimes render the progress card as a sibling of the answer body.
+      root.parentElement?.querySelectorAll?.(ACTIVITY_SELECTOR).forEach(node => {
+        if (node === root || root.parentElement === node.parentElement || recentlyMutated(node, now)) {
+          candidates.add(node);
+        }
+      });
+    }
+
+    document.querySelectorAll(ACTIVITY_SELECTOR).forEach(node => {
+      if (recentlyMutated(node, now)) candidates.add(node);
+    });
+
+    let best = null;
+    for (const node of candidates) {
+      if (!visible(node)) continue;
+      const scoped = isWithinRelevantTurn(node, roots);
+      const evidence = activityEvidenceFor(node, now, scoped);
+      if (!evidence) continue;
+      if (!best || evidence.score > best.score) best = evidence;
+    }
+    return best;
   }
 
   function detectError() {
-    const nodes = Array.from(document.querySelectorAll('[role="alert"], [data-testid*="error"], .text-red-500, .text-red-400'));
-    return nodes.filter(visible).some(node => matchesAny(normalize(node.innerText || node.textContent), ERROR_PATTERNS));
+    const nodes = Array.from(document.querySelectorAll(
+      '[role="alert"], [data-testid*="error"], [data-testid*="retry"], .text-red-500, .text-red-400'
+    )).filter(visible);
+    return nodes.some(node => matchesAny(descriptor(node), ERROR_PATTERNS));
   }
 
   function detectListening() {
-    const candidates = Array.from(
-      document.querySelectorAll('[role="dialog"], [data-testid*="voice"], [data-testid*="dictation"]')
-    ).filter(visible);
-    return candidates.some(node => matchesAny(descriptor(node), LISTENING_PATTERNS));
-  }
-
-  function detectWorking() {
-    return matchesAny(activeRegionText(), WORKING_PATTERNS);
+    const nodes = Array.from(document.querySelectorAll(
+      '[role="dialog"], [data-testid*="voice"], [data-testid*="dictation"]'
+    )).filter(visible);
+    return nodes.some(node => matchesAny(descriptor(node), LISTENING_PATTERNS));
   }
 
   function beginGeneration(reason) {
     clearTimeout(completionTimer);
+    completionTimer = null;
     generationActive = true;
-    const text = assistantText();
-    sessionStartLength = text.length;
-    lastAssistantLength = text.length;
-    lastAssistantChangeAt = Date.now();
-    streamingSeen = false;
-    emit("THINKING", reason);
+    generationStartedAt = Date.now();
+    generationSequence += 1;
+    generationTurn = latestConversationTurn();
+    currentAssistant = lastAssistantElement();
+    lastAssistantSignature = assistantSignature(currentAssistant);
+    lastAssistantChangeAt = 0;
+    lastWorkingSeenAt = 0;
+    emit("THINKING", reason, { source: "generation", match: `request-${generationSequence}` });
   }
 
-  function finishGeneration(reason) {
+  function cancelCompletion() {
     clearTimeout(completionTimer);
+    completionTimer = null;
+  }
+
+  function scheduleCompletion(reason) {
+    if (completionTimer) return;
     completionTimer = setTimeout(() => {
-      if (!hasStopButton() && generationActive) {
+      completionTimer = null;
+      const now = Date.now();
+      refreshAssistantTracking(now);
+      const working = detectWorking(now);
+      const assistantChangedRecently = now - lastAssistantChangeAt < STREAMING_RECENT_MS;
+      const stableForMs = now - Math.max(lastAssistantChangeAt, lastWorkingSeenAt, generationStartedAt);
+      if (detector.shouldComplete({
+        generationActive,
+        stopVisible: hasStopButton(),
+        working: Boolean(working),
+        assistantChangedRecently,
+        stableForMs,
+        requiredStableMs: COMPLETION_STABLE_MS
+      })) {
         generationActive = false;
-        emit("COMPLETED", reason);
+        emit("COMPLETED", reason, { source: "stable-generation", match: `${stableForMs}ms stable` });
+      } else if (generationActive && !hasStopButton()) {
+        scheduleCompletion(reason);
       }
-    }, 700);
+    }, COMPLETION_STABLE_MS);
   }
 
   function evaluate() {
+    const now = Date.now();
+
     if (detectError()) {
       generationActive = false;
-      emit("ERROR", "visible error alert");
+      cancelCompletion();
+      emit("ERROR", "visible error alert", { source: "error-region", match: "error pattern" });
       return;
     }
     if (detectListening()) {
-      emit("LISTENING", "voice UI detected");
+      cancelCompletion();
+      emit("LISTENING", "voice UI detected", { source: "voice-region", match: "listening pattern" });
       return;
     }
 
     const stop = hasStopButton();
-    const text = assistantText();
-    if (text.length !== lastAssistantLength) {
-      lastAssistantLength = text.length;
-      lastAssistantChangeAt = Date.now();
-    }
-
     if (stop && !generationActive) beginGeneration("stop control appeared");
+    refreshAssistantTracking(now);
 
     if (generationActive || stop) {
-      if (detectWorking()) {
-        emit("WORKING", "tool activity text detected");
-      } else if (text.length > sessionStartLength + 2 || Date.now() - lastAssistantChangeAt < 800) {
-        streamingSeen = true;
-        emit("STREAMING", "assistant message changing");
-      } else if (!streamingSeen) {
-        emit("THINKING", "generation active before text");
+      const workingEvidence = detectWorking(now);
+      if (workingEvidence) lastWorkingSeenAt = now;
+      const workingHeld = lastWorkingSeenAt > 0 && now - lastWorkingSeenAt < WORKING_HOLD_MS;
+      const assistantChangedRecently = lastAssistantChangeAt > 0 && now - lastAssistantChangeAt < STREAMING_RECENT_MS;
+      const state = detector.deriveGenerationState({
+        working: Boolean(workingEvidence) || workingHeld,
+        assistantChangedRecently,
+        generationActive,
+        stopVisible: stop
+      });
+
+      if (state === "WORKING") {
+        cancelCompletion();
+        emit("WORKING", workingEvidence ? "active tool region detected" : "holding recent tool activity", workingEvidence || {
+          source: "working-hold",
+          match: `${now - lastWorkingSeenAt}ms since tool activity`
+        });
+      } else if (state === "STREAMING") {
+        cancelCompletion();
+        emit("STREAMING", "current assistant turn is changing", {
+          source: "assistant-turn",
+          match: `${now - lastAssistantChangeAt}ms since change`
+        });
+      } else {
+        emit("THINKING", "generation active without current tool or response activity", {
+          source: "generation",
+          match: stop ? "stop control visible" : "generation session active"
+        });
       }
-      if (!stop) finishGeneration("stop control disappeared");
+
+      if (!stop) scheduleCompletion("generation became stable");
       return;
     }
 
-    // Do not overwrite Completed immediately; it remains visible until the next request.
-    if (!lastState) emit("READY", "page initialized");
+    if (!lastState) emit("READY", "page initialized", { source: "page", match: "initial state" });
   }
 
   function scheduleEvaluate() {
@@ -185,8 +376,7 @@
   }
 
   document.addEventListener("submit", event => {
-    const target = event.target;
-    if (target instanceof HTMLFormElement) beginGeneration("composer form submitted");
+    if (event.target instanceof HTMLFormElement) beginGeneration("composer form submitted");
   }, true);
 
   document.addEventListener("click", event => {
@@ -195,19 +385,27 @@
 
   document.addEventListener("keydown", event => {
     if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
-    const target = event.target;
-    const composer = target?.closest?.('textarea, [contenteditable="true"]');
+    const composer = event.target?.closest?.('textarea, [contenteditable="true"]');
     if (composer) setTimeout(() => {
       if (hasStopButton()) beginGeneration("enter submitted composer");
     }, 40);
   }, true);
 
-  const observer = new MutationObserver(scheduleEvaluate);
+  const observer = new MutationObserver(mutations => {
+    const now = Date.now();
+    for (const mutation of mutations) markMutation(mutation.target, now);
+    scheduleEvaluate();
+  });
   observer.observe(document.documentElement, {
-    subtree: true, childList: true, characterData: true,
-    attributes: true, attributeFilter: ["aria-label", "data-testid", "disabled"]
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: [
+      "aria-label", "aria-live", "aria-busy", "role", "data-testid", "data-state", "disabled", "class"
+    ]
   });
 
-  setInterval(evaluate, 1200);
+  setInterval(evaluate, 1000);
   evaluate();
 })();
