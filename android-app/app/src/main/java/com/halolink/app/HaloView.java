@@ -1,6 +1,5 @@
 package com.halolink.app;
 
-import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.BlurMaskFilter;
 import android.graphics.Canvas;
@@ -10,13 +9,14 @@ import android.graphics.RectF;
 import android.graphics.SweepGradient;
 import android.graphics.Typeface;
 import android.os.Build;
+import android.os.SystemClock;
 import android.view.View;
-import android.view.animation.LinearInterpolator;
 
 import java.util.Locale;
 
 public class HaloView extends View {
     private static final long OLED_SHIFT_INTERVAL_MS = 120_000L;
+    private static final long ANIMATION_CYCLE_MS = 2_200L;
     private static final float[] SWEEP_POSITIONS = {0f, .35f, .72f, 1f};
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -24,7 +24,6 @@ public class HaloView extends View {
     private final Paint subTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF ringOval = new RectF();
     private final int[] sweepColors = new int[4];
-    private final ValueAnimator animator;
     private BlurMaskFilter glowFilter;
     private SweepGradient sweepGradient;
     private float cachedStroke = -1f;
@@ -36,11 +35,25 @@ public class HaloView extends View {
     private float phase = 0f;
     private boolean animationsEnabled = true;
     private boolean attached = false;
+    private boolean minimalIdleMode = false;
+    private long animationEpochMs = SystemClock.elapsedRealtime();
+
+    private final Runnable animationFrameRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!shouldAnimate()) return;
+            long elapsedMs = Math.max(0L, SystemClock.elapsedRealtime() - animationEpochMs);
+            phase = (elapsedMs % ANIMATION_CYCLE_MS) / (float) ANIMATION_CYCLE_MS;
+            invalidate();
+            long frameDelayMs = EnergyPolicy.animationFrameDelayMs(state);
+            if (frameDelayMs > 0L) postDelayed(this, frameDelayMs);
+        }
+    };
 
     private final Runnable oledShiftRunnable = new Runnable() {
         @Override
         public void run() {
-            if (!attached || !animationsEnabled || EnergyPolicy.isAnimatedState(state)) return;
+            if (!attached || !animationsEnabled || shouldAnimate()) return;
             invalidate();
             postDelayed(this, OLED_SHIFT_INTERVAL_MS);
         }
@@ -60,23 +73,18 @@ public class HaloView extends View {
         subTextPaint.setColor(Color.rgb(130, 138, 148));
         subTextPaint.setTextAlign(Paint.Align.CENTER);
         subTextPaint.setTypeface(Typeface.create("sans", Typeface.NORMAL));
-        animator = ValueAnimator.ofFloat(0f, 1f);
-        animator.setDuration(2200);
-        animator.setRepeatCount(ValueAnimator.INFINITE);
-        animator.setInterpolator(new LinearInterpolator());
-        animator.addUpdateListener(value -> {
-            phase = (float) value.getAnimatedValue();
-            invalidate();
-        });
     }
 
     public boolean setStatus(String newState, String newLabel) {
         String normalized = newState == null ? "READY" : newState.toUpperCase(Locale.ROOT);
         String resolvedLabel = newLabel == null || newLabel.isEmpty()
                 ? defaultLabel(normalized) : newLabel;
-        if (normalized.equals(state) && resolvedLabel.equals(label)) return false;
+        boolean exitMinimalMode = minimalIdleMode
+                && !EnergyPolicy.supportsMinimalDisplay(normalized);
+        if (normalized.equals(state) && resolvedLabel.equals(label) && !exitMinimalMode) return false;
         state = normalized;
         label = resolvedLabel;
+        if (exitMinimalMode) minimalIdleMode = false;
         updateAnimationPolicy();
         invalidate();
         return true;
@@ -92,13 +100,31 @@ public class HaloView extends View {
         updateAnimationPolicy();
     }
 
+    public boolean setMinimalIdleMode(boolean enabled) {
+        if (minimalIdleMode == enabled) return false;
+        minimalIdleMode = enabled;
+        updateAnimationPolicy();
+        invalidate();
+        return true;
+    }
+
+    public boolean isMinimalIdleMode() {
+        return minimalIdleMode;
+    }
+
+    private boolean shouldAnimate() {
+        return attached
+                && animationsEnabled
+                && !minimalIdleMode
+                && EnergyPolicy.isAnimatedState(state);
+    }
+
     private void updateAnimationPolicy() {
+        removeCallbacks(animationFrameRunnable);
         removeCallbacks(oledShiftRunnable);
-        boolean shouldAnimate = attached && animationsEnabled && EnergyPolicy.isAnimatedState(state);
-        if (shouldAnimate) {
-            if (!animator.isStarted()) animator.start();
+        if (shouldAnimate()) {
+            post(animationFrameRunnable);
         } else {
-            if (animator.isStarted()) animator.cancel();
             if (attached && animationsEnabled) {
                 postDelayed(oledShiftRunnable, OLED_SHIFT_INTERVAL_MS);
             }
@@ -148,10 +174,20 @@ public class HaloView extends View {
         float burnY = (float) Math.cos(burnPhase * 0.83) * 3f;
         float cx = w / 2f + burnX;
         float cy = h / 2f + burnY;
+        int color = colorForState();
+
+        if (minimalIdleMode) {
+            paint.setStyle(Paint.Style.FILL);
+            paint.setShader(null);
+            paint.setMaskFilter(null);
+            paint.setColor(withAlpha(color, 220));
+            canvas.drawCircle(cx, cy, Math.max(5f, min * .018f), paint);
+            return;
+        }
+
         float radius = min * 0.31f;
         float stroke = Math.max(10f, min * 0.022f);
         ringOval.set(cx - radius, cy - radius, cx + radius, cy + radius);
-        int color = colorForState();
         updateEffectCache(cx, cy, stroke, color);
 
         paint.setStyle(Paint.Style.STROKE);
@@ -305,8 +341,8 @@ public class HaloView extends View {
     @Override
     protected void onDetachedFromWindow() {
         attached = false;
+        removeCallbacks(animationFrameRunnable);
         removeCallbacks(oledShiftRunnable);
-        if (animator.isStarted()) animator.cancel();
         super.onDetachedFromWindow();
     }
 }

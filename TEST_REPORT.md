@@ -1,210 +1,187 @@
-# HaloLink v0.1.6 省电优化测试报告
+# HaloLink v0.1.7 省电重构测试报告
 
 测试日期：2026-07-24（Europe/Dublin）
 
-目标设备：HUAWEI Mate 20 Pro / Android 10
-
-测试方式：Gradle、Android Lint、单元测试、APK 元数据、Bridge 日志、`/health`、
-Chrome 扩展回归测试和现有手机 WebSocket 连接
+目标设备：HUAWEI Mate 20 Pro / Android 10 / `LYA-AL00`
 
 ## 结论
 
-HaloLink v0.1.6 已完成手机端省电优化，同时保留：
+HaloLink v0.1.7 已完成 Android 端第二轮省电重构。完整模式的状态颜色、blur、glow、
+圆环层数和文字布局保持不变；静态待机、断线恢复、动画帧率和网络重试策略已重新设计。
 
-- `/ws/phone` 实时状态推送；
-- WebSocket 断线时的 `/api/state` HTTP polling 备用通道；
-- Bridge 自动发现、端口验证和断线重连；
-- Ready、Thinking、Working、Responding、Completed、Error 全部显示状态；
-- 手机屏幕常亮的实时状态指示器用途。
+本地 Android 编译、8 个策略单元测试、Android Lint、APK 构建、Bridge Python
+语法检查和 12 个 Chrome 状态识别测试全部通过。v0.1.7 APK 已成功安装到 Mate 20 Pro，
+完整 Halo、极简待机、Bridge 重启恢复、Activity 前后台恢复均通过实机验证。
 
-本地干净构建、3 个 Android 省电策略测试、Android Lint 和 12 个 Chrome 状态识别
-测试均通过。运行中的 v0.1.6 Bridge 上，浏览器和手机均自动重连，完整 Demo 状态序列
-每一步均投递 `1/1`。
+## 新的耗电策略
 
-## 原有耗电原因
+### 显示和动画
 
-1. Android App 即使 WebSocket 正常，也每 1.5 秒请求一次 `/api/state`，约
-   2,400 次 HTTP 请求/小时。
-2. `HaloView` 的无限 `ValueAnimator` 在 Ready 和 Completed 等静态状态下仍持续
-   `invalidate()`；60 Hz 屏幕上理论上可达到约 216,000 次重绘/小时。
-3. 圆环使用全局软件渲染，且每帧新建 `RectF`、`BlurMaskFilter`、`SweepGradient`
-   和渐变数组，增加 CPU、GC 和绘图负担。
-4. mDNS 的 `MulticastLock` 从 App 启动一直持有到 `onDestroy()`。
-5. App 进入后台后没有在 `onStop()` 暂停网络、发现、polling 和动画。
-6. 手机浏览器 `/display` 在 WebSocket 健康时仍保留一个每 1.5 秒唤醒的 JS 定时器，
-   虽然不会真正发送 HTTP 请求。
-7. 屏幕为了状态指示功能保持常亮，长时间 Ready 时仍使用系统亮度。
+- `READY` 或 `COMPLETED` 保持 30 秒后，完整 Halo 切换为中央小状态点。
+- 极简模式不绘制文字、大圆环、glow 或 `BlurMaskFilter`，窗口亮度最高为 5%。
+- Bridge 或局域网持续不可用时，30 秒后也进入低亮度静态断线显示。
+- 极简状态仍每两分钟移动数个像素，保留 OLED 防烧屏策略。
+- 完整模式的 blur、glow、圆环绘制和状态颜色没有缩减。
+- 动态状态由唯一的定时帧任务驱动，phase 根据 `elapsedRealtime` 计算：
+  - `WORKING`、`STREAMING`：30 FPS
+  - `SEARCHING`、`CONNECTING`：24 FPS
+  - `THINKING`、`LISTENING`：20 FPS
+  - `ERROR`：10 FPS
+  - `READY`、`COMPLETED`：0 FPS
 
-## 修改内容
+### 网络和发现
 
-### Android 网络和生命周期
+- 只在 Activity 前台且存在 Wi-Fi/以太网局域网时运行连接流程。
+- 网络丢失后取消 mDNS、WebSocket、polling、重连和所有在途 HTTP 请求。
+- 每轮 mDNS discovery 最多运行 8 秒，结束后立即释放 `MulticastLock`。
+- mDNS 失败按 `5/10/20/30/30...` 秒退避。
+- discovery、resolve、端口扫描、WebSocket 和 polling 各自使用代次或对象身份保护，
+  旧异步回调不能覆盖新连接。
 
-- WebSocket 健康后立即停止 HTTP polling。
-- 只有前台、已选定 Bridge、WebSocket 未连接时才启动 1.5 秒 polling。
-- polling 加入 in-flight 合并，避免慢请求重叠。
-- WebSocket 失败或关闭后恢复 polling，并继续自动重连。
-- `onStop()` 暂停 WebSocket、polling、mDNS、重连任务和动画。
-- 回到 `onStart()` 后重新验证保存的 Bridge 地址并自动恢复连接。
-- mDNS `MulticastLock` 仅在发现期间持有，发现停止或成功解析后立即释放。
-- 删除未使用的 `WAKE_LOCK` 权限；屏幕常亮仍由可见 Activity 的
-  `FLAG_KEEP_SCREEN_ON` 控制。
+### WebSocket 和 fallback
 
-### Android 绘图和亮度
-
-- Ready、Completed 停止 `ValueAnimator`，只在状态改变或每两分钟 OLED 像素位移时
-  重绘。
-- Thinking、Working、Responding、Listening、Error 和连接状态保留动态效果。
-- Android 9 及以上使用硬件渲染；仅 Android 8.x 保留软件兼容路径。
-- 缓存并复用 `RectF`、模糊滤镜、SweepGradient 和渐变数组，消除逐帧对象分配。
-- 相同状态和标签重复到达时不再触发重绘或重置亮度计时。
-- Ready、Completed 显示 30 秒后，将 App 窗口亮度限制在当前系统亮度和 12% 中较低的
-  数值；新活动状态到达时立即恢复系统亮度。
-
-### `/display` 浏览器页面
-
-- WebSocket 正常时销毁 polling 定时器，而不是每 1.5 秒空调用一次。
-- WebSocket 断线时才创建 polling 定时器。
-- 页面隐藏后暂停 polling 和重连；重新可见时自动恢复。
-
-### 自动化和版本
-
-- Android 版本升级到 `0.1.6` / `versionCode 4`。
-- 新增 `EnergyPolicy` 纯 Java 策略及 3 个单元测试。
-- GitHub Android 工作流现在执行
-  `testDebugUnitTest lintDebug assembleDebug`。
-- 构建脚本和 APK 工作流产物名更新为 `HaloLink-v0.1.6-debug.apk`。
+- WebSocket 重连按 `2/4/8/15/30/30...` 秒退避，并加入 0–1000 毫秒抖动。
+- 前五次直接重连已验证的 `host:port`，避免每次都扫描十个端口。
+- 多次失败后先验证 `/health`；Bridge 已不可用时才回到 mDNS。
+- HTTP fallback 只在前台、WebSocket 未连接且 Bridge 已选定时运行。
+- polling 根据断线时间降频为 `1.5/3/6` 秒，并继续防止请求重叠。
+- polling 响应同时检查 host、port 和连接代次。
+- `/ws/phone` 只由 Android 每 45 秒主动 PING；aiohttp 保留自动 PONG，但不再主动
+  为 phone 连接创建第二套 heartbeat。
 
 ## 自动化验证
 
-### Android 干净构建
+### Android 单元测试
 
 执行：
 
 ```text
-./gradlew --no-daemon clean testDebugUnitTest lintDebug assembleDebug
+./gradlew --no-daemon testDebugUnitTest
+```
+
+结果：
+
+```text
+tests=8, failures=0, errors=0, skipped=0
+BUILD SUCCESSFUL
+```
+
+覆盖 polling 条件、静态/动态状态、每个目标 FPS、WebSocket 和 mDNS 退避、渐进
+polling 间隔、大小写无关的 idle 判断，以及 5% 极简亮度上限。
+
+### Android Lint 和 APK
+
+执行：
+
+```text
+./gradlew --no-daemon lintDebug assembleDebug
 ```
 
 结果：
 
 ```text
 BUILD SUCCESSFUL
-48 actionable tasks
+Lint: 0 errors, 23 warnings
 ```
 
-### Android 单元测试
+23 个 warning 是目标/依赖可更新提示、固定竖屏、未使用颜色和既有 launcher icon
+资源提示；本轮修改的 Java 源文件没有 Lint issue。
 
-`EnergyPolicyTest`：
-
-```text
-tests=3, failures=0, errors=0, skipped=0
-```
-
-覆盖：
-
-- WebSocket 健康时禁止 polling；
-- 后台或未选定 Bridge 时禁止 polling；
-- 仅断线前台状态启用备用 polling；
-- Ready、Completed 为静态和空闲状态；
-- Thinking、Working、Streaming、Error 等动态状态继续动画。
-
-### Android Lint
-
-结果：
-
-```text
-0 errors, 22 warnings
-```
-
-原先与逐帧 `RectF`、`BlurMaskFilter`、`SweepGradient` 分配有关的 5 个
-`DrawAllocation` 警告已全部消除。剩余警告为 SDK/Gradle 可用更新、固定竖屏和已有图标
-资源等，与本次省电逻辑无关。
-
-### APK
+APK：
 
 ```text
 package: com.halolink.app
-versionCode: 4
-versionName: 0.1.6
+versionCode: 5
+versionName: 0.1.7
 minSdk: 26
 targetSdk: 36
+
+apk/HaloLink-v0.1.7-debug.apk
+SHA-256: a780d1c8e8916654be6c5f1dbc8b26563573648be932bad59dab4f7317a622e5
 ```
 
-未再包含 `android.permission.WAKE_LOCK`。
+### Chrome 和 Bridge
 
-本地 APK：
+- `python3 -m py_compile mac-bridge/bridge.py`：通过。
+- `node --check`：Chrome background/content 脚本通过。
+- `node --test chrome-extension/tests/state-detector.test.js`：12/12 通过。
+- v0.1.7 Bridge 重启后 `/health.version` 为 `0.1.7`。
+
+## Mate 20 Pro 实机验证
+
+### 安装和连接
 
 ```text
-apk/HaloLink-v0.1.6-debug.apk
-SHA-256: 69509302a7e66e6fa054de0a4ed2a44c1afde27f1ff907f8358ffa5a3f331b54
+adb install -r apk/HaloLink-v0.1.7-debug.apk
+Performing Streamed Install
+Success
+
+versionCode=5
+versionName=0.1.7
 ```
 
-### Chrome 扩展和 Bridge
+App 启动后验证保存的 `192.168.0.36:8766`，Bridge `/health` 返回
+`phoneClients: 1`。
 
-- `node --test chrome-extension/tests/state-detector.test.js`：12/12 通过。
-- Chrome background/content/popup JavaScript 语法：通过。
-- `/display` inline JavaScript 语法：通过。
-- Bridge Python 编译检查：通过。
-- shell 脚本语法检查：通过。
+### 显示
 
-## 当前连接与状态投递验证
+- `WORKING`：完整橙色圆环、旋转亮弧、glow、主标题和副标题均正常。
+- `READY` 30 秒后：画面只保留中央绿色状态点，背景为纯黑。
+- 日志确认：`idle display entered minimal 5% brightness mode`。
+- 从极简状态收到 `WORKING` 后立即恢复完整 Halo 和系统窗口亮度。
 
-重启 `com.halolink.bridge` 后：
+### Bridge 重启
 
-```json
-{
-  "version": "0.1.6",
-  "port": 8766,
-  "browserClients": 1,
-  "phoneClients": 1
-}
+Bridge 重启时手机收到正常关闭事件，首次重连日志为：
+
+```text
+reconnect scheduled ... attempt=0 delayMs=2741 verify=false
+WebSocket opened ... generation=2
 ```
 
-手机 `192.168.0.70` 和 Chrome 扩展均自动重连。Demo 实测：
+这符合 2 秒基础退避加 0–1000 毫秒抖动；重连后 Bridge 再次显示
+`phoneClients: 1`。
 
-| 协议状态 | 手机投递 |
-| --- | --- |
-| READY | 1/1 |
-| THINKING | 1/1 |
-| WORKING | 1/1 |
-| STREAMING / Responding | 1/1 |
-| COMPLETED | 1/1 |
-| ERROR | 1/1 |
-| READY | 1/1 |
+### Activity 生命周期
 
-最终 `/health`：
+将 App 切到后台后：
 
-```json
-{
-  "state": {"state": "READY", "source": "test"},
-  "browserClients": 1,
-  "phoneClients": 1,
-  "lastDelivery": {"attempted": 1, "sent": 1, "failed": 0}
-}
+```text
+LAN network callback unregistered
+app left foreground; all connection and animation work paused
 ```
 
-## 预期节省
+五秒后 Bridge 为 `phoneClients: 0`，没有新的 reconnect、polling 或 discovery 日志。
+重新打开 App 后自动验证保存地址并恢复为 `phoneClients: 1`。
 
-在 WebSocket 健康、手机保持 Ready 的典型空闲场景：
+### 帧统计
 
-- HTTP polling：约 `2,400 次/小时 → 0 次/小时`；
-- 圆环重绘：约 `216,000 次/小时 → 约 30 次/小时`，另加实际状态变化；
-- mDNS MulticastLock：从 Activity 全生命周期持有改为仅发现阶段持有；
-- Ready/Completed：30 秒后降低 App 窗口亮度；
-- WebSocket 20 秒 keepalive 保留，以维持实时推送和快速断线检测。
+在 `WORKING` 状态采集的 `gfxinfo` 时间窗约 28.4 秒：
 
-以上是由执行路径和频率得出的预期改善，不等同于电池百分比测量。实际续航提升仍受
-系统亮度、OLED 面板、Wi-Fi 信号和状态动画持续时间影响。
+```text
+Total frames rendered: 825
+Janky frames: 1 (0.12%)
+```
 
-## 实机验证边界
+约为 29 FPS，符合 30 FPS 上限目标；单帧 50/90/95 百分位分别为
+`7/7/8 ms`。
 
-测试时 Bridge 可以看到 `192.168.0.70` 的手机 WebSocket 已连接，完整状态序列均已
-`1/1` 投递。但本机 `adb devices` 没有列出设备，旧无线 ADB 地址
-`192.168.0.70:5555` 返回 `Connection refused`，因此本轮无法：
+## 仍需长期验证
 
-- 将 v0.1.6 APK 安装到 Mate 20 Pro；
-- 使用 scrcpy 观察新 APK 的视觉状态；
-- 通过 logcat 直接确认 “WebSocket healthy → polling stopped”；
-- 进行 v0.1.5/v0.1.6 的定时电量 A/B 测试。
+- 5% 窗口亮度和小状态点已在目标手机上可见，但续航提升需要长时间 A/B 测量。
+- 为避免主动断开家庭 Wi-Fi，本轮没有实机强制验证 `NetworkCallback.onLost()`；
+  该路径已通过编译、Lint 和代码代次保护检查。
+- mDNS 成功发现路径已由既有连接流程覆盖，但没有为了等待完整 8 秒而停掉当前可用
+  Bridge；超时和退避数值由纯策略测试及回调实现检查覆盖。
+- Android 10 的旧式 NSD 和沉浸模式 API 会产生编译弃用提示，但仍是当前
+  `minSdk 26` 兼容路径。
 
-因此，代码、构建、策略测试和实时网络投递已经通过；新 APK 的视觉与实际电池耗电
-测试需要手机重新开启无线 ADB 或通过 USB 连接后补充。
+## 推荐耗电 A/B 方法
+
+1. 保持同一手机、Wi-Fi、系统亮度、充电起点和屏幕常亮时间。
+2. v0.1.6 与 v0.1.7 各测试至少 2 小时，分别覆盖：
+   - 90% `READY`、10% 动态状态；
+   - Bridge 关闭的异常场景。
+3. 每轮开始前充至相同电量并等待温度稳定，关闭其他前台 App。
+4. 记录起止电量、机身温度和 `dumpsys batterystats`；每个版本至少重复三轮。
+5. 比较中位数，不用单次电池百分比变化下结论。

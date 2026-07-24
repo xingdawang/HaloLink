@@ -35,7 +35,7 @@ DEFAULT_PORT = int(os.environ.get("HALOLINK_PORT", "8766"))
 PORT_SCAN_END = int(os.environ.get("HALOLINK_PORT_END", "8775"))
 ACTIVE_PORT = DEFAULT_PORT
 SERVICE_TYPE = "_halolink._tcp.local."
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 PROJECT_PATH = str(Path(__file__).resolve().parent.parent)
 LOCK_PATH = Path(__file__).with_name(".halolink.lock")
 LOCK_HANDLE = None
@@ -207,7 +207,7 @@ async def set_state(payload: dict[str, Any], source: str) -> dict[str, Any]:
 
 
 async def ws_browser(request: web.Request) -> web.WebSocketResponse:
-    ws = web.WebSocketResponse(heartbeat=25)
+    ws = web.WebSocketResponse(heartbeat=45)
     await ws.prepare(request)
     BROWSER_CLIENTS.add(ws)
     print(f"Browser connected ({len(BROWSER_CLIENTS)} total)", flush=True)
@@ -239,7 +239,10 @@ async def ws_browser(request: web.Request) -> web.WebSocketResponse:
 
 
 async def ws_phone(request: web.Request) -> web.WebSocketResponse:
-    ws = web.WebSocketResponse(heartbeat=25)
+    # Android initiates one 45-second WebSocket heartbeat.  Leaving heartbeat
+    # unset here preserves aiohttp's automatic PONG response without creating a
+    # second periodic PING source on the same phone connection.
+    ws = web.WebSocketResponse()
     await ws.prepare(request)
     PHONE_CLIENTS.add(ws)
     peer = request.transport.get_extra_info("peername") if request.transport else None
