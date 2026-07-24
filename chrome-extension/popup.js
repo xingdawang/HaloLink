@@ -2,6 +2,8 @@ const dot = document.getElementById("dot");
 const connection = document.getElementById("connection");
 const stateEl = document.getElementById("state");
 const timeEl = document.getElementById("time");
+const reasonEl = document.getElementById("reason");
+const evidenceEl = document.getElementById("evidence");
 const bridgeAddress = document.getElementById("bridgeAddress");
 const bridgePid = document.getElementById("bridgePid");
 const bridgePort = document.getElementById("bridgePort");
@@ -19,6 +21,11 @@ function refresh() {
     bridgeVersion.textContent = response.bridgeInfo?.version ?? "—";
     phoneClients.textContent = response.bridgeInfo?.phoneClients ?? "—";
     stateEl.textContent = response.lastStatus?.label || response.lastStatus?.state || "—";
+    reasonEl.textContent = response.lastStatus?.reason || "No detection detail";
+    const evidence = response.lastStatus?.evidence;
+    evidenceEl.textContent = evidence?.source
+      ? [evidence.source, evidence.match, evidence.selector].filter(Boolean).join(" · ")
+      : "—";
     if (response.lastStatus?.timestamp) timeEl.textContent = new Date(response.lastStatus.timestamp).toLocaleTimeString();
   });
 }
