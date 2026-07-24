@@ -1,5 +1,6 @@
 const PORT_START = 8766;
 const PORT_END = 8775;
+const EXTENSION_VERSION = "0.1.4";
 
 let socket = null;
 let retryTimer = null;
@@ -105,7 +106,7 @@ async function connect() {
     bridgeConnected = true;
     connectAttempt = 0;
     saveSnapshot();
-    sendRaw({ type: "hello", role: "browser-extension", version: "0.1.3" });
+    sendRaw({ type: "hello", role: "browser-extension", version: EXTENSION_VERSION });
     sendStatus(lastStatus);
     clearInterval(keepAliveTimer);
     keepAliveTimer = setInterval(() => {
@@ -151,12 +152,22 @@ function sendRaw(payload) {
   return false;
 }
 
+function sanitizeEvidence(evidence) {
+  if (!evidence || typeof evidence !== "object") return null;
+  return {
+    source: String(evidence.source || "").slice(0, 80),
+    match: String(evidence.match || "").slice(0, 120),
+    selector: String(evidence.selector || "").slice(0, 160)
+  };
+}
+
 function sendStatus(status) {
   lastStatus = {
     state: String(status.state || "READY").toUpperCase(),
     label: String(status.label || status.state || "Ready"),
     timestamp: status.timestamp || new Date().toISOString(),
-    reason: status.reason || "",
+    reason: String(status.reason || "").slice(0, 160),
+    evidence: sanitizeEvidence(status.evidence),
     url: status.url || ""
   };
   saveSnapshot();
@@ -193,7 +204,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === "HALOLINK_TEST") {
-    sendStatus({ state: message.state, label: message.label || message.state });
+    sendStatus({ state: message.state, label: message.label || message.state, reason: "manual popup test" });
     sendResponse({ ok: true, bridgeConnected, bridgePort });
   }
 });
