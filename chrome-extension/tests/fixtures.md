@@ -5,6 +5,7 @@ Real ChatGPT DOM snapshots should be sanitized before they are committed. Keep o
 Recommended fixtures:
 
 - `thinking.html`
+- `generic-thinking-spinner.html`
 - `web-search.html`
 - `code-running.html`
 - `streaming.html`

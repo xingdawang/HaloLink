@@ -16,6 +16,7 @@
   const LISTENING_PATTERNS = ["listening", "正在聆听", "正在听"];
   const TURN_SELECTOR = '[data-testid^="conversation-turn"], article';
   const ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]';
+  const RESPONSE_BODY_SELECTOR = '.markdown, [data-testid="assistant-message-content"]';
   const ACTIVITY_SELECTOR = [
     '[role="status"]',
     '[role="progressbar"]',
@@ -44,7 +45,9 @@
   let currentAssistant = null;
   let lastAssistantSignature = "";
   let lastAssistantChangeAt = 0;
+  let assistantResponseStarted = false;
   let lastWorkingSeenAt = 0;
+  let generationPhase = "";
   let lastState = "";
   let completionTimer = null;
   let evaluateTimer = null;
@@ -85,7 +88,7 @@
   }
 
   function emit(state, reason = "", evidence = null) {
-    if (state === lastState && state !== "STREAMING") return;
+    if (state === lastState) return;
     lastState = state;
     try {
       if (!chrome.runtime?.id) return;
@@ -152,9 +155,12 @@
 
   function assistantSignature(el) {
     if (!el) return "";
-    const text = normalize(el.innerText || el.textContent || "");
-    const richNodes = el.querySelectorAll("pre, code, table, img, svg, a, blockquote").length;
-    return [text.length, text.slice(-160), richNodes, el.childElementCount].join(":");
+    const bodies = Array.from(el.querySelectorAll(RESPONSE_BODY_SELECTOR)).filter(visible);
+    const body = bodies.length ? bodies[bodies.length - 1] : null;
+    if (!body) return "";
+    const text = normalize(body.innerText || body.textContent || "");
+    const richNodes = body.querySelectorAll("pre, code, table, img, svg, a, blockquote").length;
+    return [text.length, text.slice(-160), richNodes, body.childElementCount].join(":");
   }
 
   function refreshAssistantTracking(now) {
@@ -162,7 +168,10 @@
     if (latest !== currentAssistant) {
       currentAssistant = latest;
       lastAssistantSignature = assistantSignature(latest);
-      if (generationActive && latest) lastAssistantChangeAt = now;
+      if (generationActive && lastAssistantSignature) {
+        assistantResponseStarted = true;
+        lastAssistantChangeAt = now;
+      }
       const turn = turnFor(latest);
       if (turn) generationTurn = turn;
       return;
@@ -171,7 +180,10 @@
     const signature = assistantSignature(latest);
     if (signature !== lastAssistantSignature) {
       lastAssistantSignature = signature;
-      lastAssistantChangeAt = now;
+      if (signature) {
+        assistantResponseStarted = true;
+        lastAssistantChangeAt = now;
+      }
     }
   }
 
@@ -270,15 +282,18 @@
   }
 
   function beginGeneration(reason) {
+    if (generationActive) return;
     clearTimeout(completionTimer);
     completionTimer = null;
     generationActive = true;
+    generationPhase = "THINKING";
     generationStartedAt = Date.now();
     generationSequence += 1;
     generationTurn = latestConversationTurn();
     currentAssistant = lastAssistantElement();
     lastAssistantSignature = assistantSignature(currentAssistant);
     lastAssistantChangeAt = 0;
+    assistantResponseStarted = false;
     lastWorkingSeenAt = 0;
     emit("THINKING", reason, { source: "generation", match: `request-${generationSequence}` });
   }
@@ -306,6 +321,8 @@
         requiredStableMs: COMPLETION_STABLE_MS
       })) {
         generationActive = false;
+        generationPhase = "";
+        assistantResponseStarted = false;
         emit("COMPLETED", reason, { source: "stable-generation", match: `${stableForMs}ms stable` });
       } else if (generationActive && !hasStopButton()) {
         scheduleCompletion(reason);
@@ -318,6 +335,8 @@
 
     if (detectError()) {
       generationActive = false;
+      generationPhase = "";
+      assistantResponseStarted = false;
       cancelCompletion();
       emit("ERROR", "visible error alert", { source: "error-region", match: "error pattern" });
       return;
@@ -337,21 +356,28 @@
       if (workingEvidence) lastWorkingSeenAt = now;
       const workingHeld = lastWorkingSeenAt > 0 && now - lastWorkingSeenAt < WORKING_HOLD_MS;
       const assistantChangedRecently = lastAssistantChangeAt > 0 && now - lastAssistantChangeAt < STREAMING_RECENT_MS;
-      const state = detector.deriveGenerationState({
+      const candidateState = detector.deriveGenerationState({
         working: Boolean(workingEvidence) || workingHeld,
         assistantChangedRecently,
+        assistantResponseStarted,
         generationActive,
         stopVisible: stop
       });
+      generationPhase = detector.advanceGenerationPhase(generationPhase, candidateState);
+      const state = generationPhase;
+      const activityOngoing = detector.hasOngoingGenerationActivity({
+        stopVisible: stop,
+        working: Boolean(workingEvidence) || workingHeld,
+        assistantChangedRecently
+      });
+      if (activityOngoing) cancelCompletion();
 
       if (state === "WORKING") {
-        cancelCompletion();
         emit("WORKING", workingEvidence ? "active tool region detected" : "holding recent tool activity", workingEvidence || {
           source: "working-hold",
           match: `${now - lastWorkingSeenAt}ms since tool activity`
         });
       } else if (state === "STREAMING") {
-        cancelCompletion();
         emit("STREAMING", "current assistant turn is changing", {
           source: "assistant-turn",
           match: `${now - lastAssistantChangeAt}ms since change`

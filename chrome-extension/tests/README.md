@@ -6,4 +6,4 @@ Run the dependency-free regression suite from the repository root:
 node --test chrome-extension/tests/state-detector.test.js
 ```
 
-The tests cover tool activity rendered outside the assistant answer body, semantic progress cards, progressbar-only activity, false-positive suppression, state priority, state fallback, streaming transitions, and stable completion.
+The tests cover tool activity rendered outside the assistant answer body, semantic progress cards, progressbar-only activity, generic-thinking false-positive suppression, monotonic generation phases, response-start latching, and stable completion.

@@ -60,12 +60,14 @@
     if (animated) score += 1;
     if (recentlyMutated) score += 1;
 
+    const activeStateEvidence = activeState &&
+      (ariaBusy || animated) &&
+      (liveRegion || recentlyMutated);
     const active = Boolean(
       textMatch ||
       semanticMatch ||
       progressbar ||
-      (ariaBusy && (activeState || animated || liveRegion)) ||
-      (recentlyMutated && liveRegion && animated)
+      activeStateEvidence
     );
 
     let source = "";
@@ -79,12 +81,12 @@
     } else if (progressbar) {
       source = "progressbar";
       match = "progressbar";
+    } else if (activeStateEvidence) {
+      source = "active-state";
+      match = dataState || "active state";
     } else if (ariaBusy) {
       source = "aria-busy";
       match = "aria-busy=true";
-    } else if (recentlyMutated && liveRegion && animated) {
-      source = "live-region";
-      match = "recent animated live region";
     }
 
     return { active, score, source, match };
@@ -94,9 +96,31 @@
     if (input.error) return "ERROR";
     if (input.listening) return "LISTENING";
     if (input.working) return "WORKING";
-    if (input.assistantChangedRecently) return "STREAMING";
+    if (input.assistantChangedRecently || input.assistantResponseStarted) return "STREAMING";
     if (input.generationActive || input.stopVisible) return "THINKING";
     return "";
+  }
+
+  const GENERATION_PHASE_ORDER = {
+    THINKING: 1,
+    WORKING: 2,
+    STREAMING: 3
+  };
+
+  function advanceGenerationPhase(current, candidate) {
+    if (!GENERATION_PHASE_ORDER[candidate]) return current || candidate;
+    if (!GENERATION_PHASE_ORDER[current]) return candidate;
+    return GENERATION_PHASE_ORDER[candidate] > GENERATION_PHASE_ORDER[current]
+      ? candidate
+      : current;
+  }
+
+  function hasOngoingGenerationActivity(input = {}) {
+    return Boolean(
+      input.stopVisible ||
+      input.working ||
+      input.assistantChangedRecently
+    );
   }
 
   function shouldComplete(input = {}) {
@@ -116,6 +140,8 @@
     firstMatch,
     classifyActivityEvidence,
     deriveGenerationState,
+    advanceGenerationPhase,
+    hasOngoingGenerationActivity,
     shouldComplete
   };
 });

@@ -39,6 +39,16 @@ test("does not classify a generic stable live region as working", () => {
   assert.equal(result.active, false);
 });
 
+test("does not classify the generic ChatGPT thinking spinner as working", () => {
+  const result = detector.classifyActivityEvidence({
+    text: "Thinking",
+    ariaBusy: "true",
+    hasSpinner: true,
+    recentlyMutated: true
+  });
+  assert.equal(result.active, false);
+});
+
 test("state priority keeps WORKING above STREAMING", () => {
   assert.equal(detector.deriveGenerationState({
     generationActive: true,
@@ -47,12 +57,45 @@ test("state priority keeps WORKING above STREAMING", () => {
   }), "WORKING");
 });
 
-test("state can return from WORKING to THINKING before text resumes", () => {
-  assert.equal(detector.deriveGenerationState({
-    generationActive: true,
-    working: false,
-    assistantChangedRecently: false
-  }), "THINKING");
+test("generation phases advance without regressing during DOM gaps", () => {
+  let phase = detector.advanceGenerationPhase("", "THINKING");
+  assert.equal(phase, "THINKING");
+
+  phase = detector.advanceGenerationPhase(phase, "WORKING");
+  assert.equal(phase, "WORKING");
+
+  phase = detector.advanceGenerationPhase(phase, "THINKING");
+  assert.equal(phase, "WORKING");
+
+  phase = detector.advanceGenerationPhase(phase, "STREAMING");
+  assert.equal(phase, "STREAMING");
+
+  phase = detector.advanceGenerationPhase(phase, "WORKING");
+  assert.equal(phase, "STREAMING");
+
+  phase = detector.advanceGenerationPhase(phase, "THINKING");
+  assert.equal(phase, "STREAMING");
+});
+
+test("a tool request emits each visible generation phase once", () => {
+  const candidates = [
+    "THINKING",
+    "THINKING",
+    "WORKING",
+    "THINKING",
+    "WORKING",
+    "STREAMING",
+    "THINKING",
+    "STREAMING"
+  ];
+  let phase = "";
+  const emitted = [];
+  for (const candidate of candidates) {
+    const next = detector.advanceGenerationPhase(phase, candidate);
+    if (next !== phase) emitted.push(next);
+    phase = next;
+  }
+  assert.deepEqual(emitted, ["THINKING", "WORKING", "STREAMING"]);
 });
 
 test("state changes to STREAMING when the current answer mutates", () => {
@@ -61,6 +104,30 @@ test("state changes to STREAMING when the current answer mutates", () => {
     working: false,
     assistantChangedRecently: true
   }), "STREAMING");
+});
+
+test("state stays STREAMING after the response body has started", () => {
+  assert.equal(detector.deriveGenerationState({
+    generationActive: true,
+    working: false,
+    assistantChangedRecently: false,
+    assistantResponseStarted: true
+  }), "STREAMING");
+});
+
+test("a stable latched response does not keep resetting completion", () => {
+  assert.equal(detector.hasOngoingGenerationActivity({
+    stopVisible: false,
+    working: false,
+    assistantChangedRecently: false,
+    assistantResponseStarted: true
+  }), false);
+
+  assert.equal(detector.hasOngoingGenerationActivity({
+    stopVisible: true,
+    working: false,
+    assistantChangedRecently: false
+  }), true);
 });
 
 test("completion requires no stop, no tool activity, and a stable answer", () => {
