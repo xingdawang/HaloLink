@@ -1,0 +1,37 @@
+name: Test Chrome Extension
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'chrome-extension/**'
+      - '.github/workflows/test-chrome-extension.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'chrome-extension/**'
+      - '.github/workflows/test-chrome-extension.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-detector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate extension scripts
+        run: |
+          node --check chrome-extension/state-detector.js
+          node --check chrome-extension/content.js
+          node --check chrome-extension/background.js
+          node --check chrome-extension/popup.js
+      - name: Run state detector tests
+        run: node --test chrome-extension/tests/state-detector.test.js
