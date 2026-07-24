@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "HaloLink for ChatGPT",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Shows ChatGPT web status on a paired HaloLink Android display.",
   "minimum_chrome_version": "116",
   "permissions": ["storage"],
@@ -16,7 +16,7 @@
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["content.js"],
+      "js": ["state-detector.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

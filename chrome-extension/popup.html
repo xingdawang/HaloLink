@@ -2,7 +2,10 @@
 <body>
   <header><div class="halo"></div><div><strong>HaloLink</strong><small>ChatGPT status bridge</small></div></header>
   <section><span id="dot" class="dot"></span><span id="connection">Checking Bridge…</span></section>
-  <section class="state"><small>Latest state</small><strong id="state">—</strong><span id="time"></span></section>
+  <section class="state">
+    <small>Latest state</small><strong id="state">—</strong><span id="time"></span>
+    <small id="reason" class="reason">—</small><code id="evidence" class="evidence">—</code>
+  </section>
   <section class="details">
     <div><small>PID</small><code id="bridgePid">—</code></div>
     <div><small>Port</small><code id="bridgePort">—</code></div>
