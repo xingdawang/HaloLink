@@ -4,7 +4,7 @@
   "version": "0.1.4",
   "description": "Shows ChatGPT web status on a paired HaloLink Android display.",
   "minimum_chrome_version": "116",
-  "permissions": ["storage"],
+  "permissions": ["storage", "scripting"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",

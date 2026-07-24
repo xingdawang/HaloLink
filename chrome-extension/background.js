@@ -174,6 +174,23 @@ function sendStatus(status) {
   sendRaw({ type: "status", ...lastStatus });
 }
 
+async function refreshChatGPTContentScripts() {
+  try {
+    const tabs = await chrome.tabs.query({
+      url: ["https://chatgpt.com/*", "https://chat.openai.com/*"]
+    });
+    await Promise.all(tabs
+      .filter(tab => Number.isInteger(tab.id))
+      .map(tab => chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ["state-detector.js", "content.js"],
+        injectImmediately: true
+      }).catch(() => {})));
+  } catch (_) {
+    // A transient Chrome startup state should not block Bridge reconnection.
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "HALOLINK_STATUS") {
     sendStatus({
@@ -209,6 +226,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-chrome.runtime.onInstalled.addListener(connect);
+chrome.runtime.onInstalled.addListener(() => {
+  connect();
+  refreshChatGPTContentScripts();
+});
 chrome.runtime.onStartup.addListener(connect);
 connect();

@@ -271,7 +271,12 @@
     const nodes = Array.from(document.querySelectorAll(
       '[role="alert"], [data-testid*="error"], [data-testid*="retry"], .text-red-500, .text-red-400'
     )).filter(visible);
-    return nodes.some(node => matchesAny(descriptor(node), ERROR_PATTERNS));
+    if (nodes.some(node => matchesAny(descriptor(node), ERROR_PATTERNS))) return true;
+
+    // ChatGPT's current error card is rendered inside the assistant turn without
+    // an alert role, test id, or the legacy red utility classes.
+    const latestAssistant = lastAssistantElement();
+    return Boolean(latestAssistant && matchesAny(descriptor(latestAssistant), ERROR_PATTERNS));
   }
 
   function detectListening() {

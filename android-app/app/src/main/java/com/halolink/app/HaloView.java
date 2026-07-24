@@ -6,7 +6,6 @@ import android.graphics.BlurMaskFilter;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
-import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.SweepGradient;
 import android.graphics.Typeface;
@@ -23,7 +22,6 @@ public class HaloView extends View {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint subTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Path checkPath = new Path();
     private final RectF ringOval = new RectF();
     private final int[] sweepColors = new int[4];
     private final ValueAnimator animator;
@@ -195,17 +193,38 @@ public class HaloView extends View {
             canvas.drawOval(ringOval, paint);
         }
 
-        if (state.equals("LISTENING")) drawListeningWaves(canvas, cx, cy - radius * .18f, color, stroke);
-        if (state.equals("COMPLETED")) drawCheck(canvas, cx, cy - radius * .20f, radius, color, stroke);
-        if (state.equals("ERROR")) drawErrorMark(canvas, cx, cy - radius * .20f, radius, color, stroke);
+        // Symbols use the upper half of the halo so they never collide with the two text lines.
+        if (state.equals("LISTENING")) drawListeningWaves(canvas, cx, cy - radius * .42f, color, stroke);
+        if (state.equals("ERROR")) drawErrorMark(canvas, cx, cy - radius * .42f, radius, color, stroke);
 
-        textPaint.setTextSize(Math.max(36f, min * 0.095f));
-        float textY = cy + radius * .20f;
-        canvas.drawText(label, cx, textY, textPaint);
+        String displayLabel = fitText(textPaint, label, Math.max(36f, min * 0.095f),
+                36f, radius * 1.60f);
+        // Keep both lines clear of the lower arc, even when a label is longer than usual.
+        float textY = cy + radius * .035f;
+        canvas.drawText(displayLabel, cx, textY, textPaint);
 
-        subTextPaint.setTextSize(Math.max(18f, min * 0.037f));
         String sub = subLabel();
-        if (!sub.isEmpty()) canvas.drawText(sub, cx, textY + min * .075f, subTextPaint);
+        if (!sub.isEmpty()) {
+            String displaySub = fitText(subTextPaint, sub, Math.max(18f, min * .037f),
+                    18f, radius * 1.52f);
+            float subTextY = textY + Math.min(min * .065f, radius * .22f);
+            canvas.drawText(displaySub, cx, subTextY, subTextPaint);
+        }
+    }
+
+    private String fitText(Paint target, String value, float preferredSize, float minimumSize,
+            float maxWidth) {
+        target.setTextSize(preferredSize);
+        float width = target.measureText(value);
+        if (width > maxWidth) {
+            target.setTextSize(Math.max(minimumSize, preferredSize * maxWidth / width));
+        }
+        if (target.measureText(value) <= maxWidth) return value;
+        String ellipsis = "…";
+        int end = target.breakText(value, 0, value.length(), true,
+                Math.max(0f, maxWidth - target.measureText(ellipsis)), null);
+        if (end > 0 && Character.isHighSurrogate(value.charAt(end - 1))) end--;
+        return end > 0 ? value.substring(0, end) + ellipsis : ellipsis;
     }
 
     private void updateEffectCache(float cx, float cy, float stroke, int color) {
@@ -246,21 +265,6 @@ public class HaloView extends View {
             case "ERROR": return "Check the browser";
             default: return "";
         }
-    }
-
-    private void drawCheck(Canvas canvas, float cx, float cy, float radius, int color, float stroke) {
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeCap(Paint.Cap.ROUND);
-        paint.setStrokeJoin(Paint.Join.ROUND);
-        paint.setStrokeWidth(stroke * .62f);
-        paint.setColor(color);
-        paint.setShadowLayer(stroke * 1.5f, 0, 0, color);
-        checkPath.reset();
-        checkPath.moveTo(cx - radius * .13f, cy);
-        checkPath.lineTo(cx - radius * .035f, cy + radius * .095f);
-        checkPath.lineTo(cx + radius * .17f, cy - radius * .12f);
-        canvas.drawPath(checkPath, paint);
-        paint.clearShadowLayer();
     }
 
     private void drawErrorMark(Canvas canvas, float cx, float cy, float radius, int color, float stroke) {
