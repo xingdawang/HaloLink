@@ -9,6 +9,7 @@ import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
 import android.view.WindowManager;
@@ -35,10 +36,13 @@ public class MainActivity extends Activity {
     private static final int PORT_START = 8766;
     private static final int PORT_END = 8775;
     private static final long POLL_INTERVAL_MS = 1500L;
-    private static final String APP_VERSION = "0.1.5";
+    private static final long IDLE_DIM_DELAY_MS = 30_000L;
+    private static final float MAX_IDLE_BRIGHTNESS = 0.12f;
+    private static final String APP_VERSION = "0.1.6";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean resolving = new AtomicBoolean(false);
+    private final AtomicBoolean pollInFlight = new AtomicBoolean(false);
     private HaloView haloView;
     private NsdManager nsdManager;
     private NsdManager.DiscoveryListener discoveryListener;
@@ -48,18 +52,32 @@ public class MainActivity extends Activity {
     private Runnable reconnectRunnable;
     private boolean discoveryRunning = false;
     private boolean destroyed = false;
+    private volatile boolean foreground = false;
+    private volatile boolean webSocketConnected = false;
     private volatile int scanGeneration = 0;
-    private String activeHost = "";
-    private int activePort = 0;
+    private volatile String activeHost = "";
+    private volatile int activePort = 0;
+
+    private final Runnable idleDimRunnable = () -> {
+        if (foreground && haloView != null && EnergyPolicy.isIdleState(haloView.getState())) {
+            setWindowBrightness(idleBrightness());
+            Log.i(TAG, "idle display dimmed to reduce OLED power");
+        }
+    };
 
     private final Runnable pollRunnable = new Runnable() {
         @Override
         public void run() {
-            if (destroyed) return;
-            if (!activeHost.isEmpty() && activePort > 0) {
+            boolean bridgeSelected = !activeHost.isEmpty() && activePort > 0;
+            if (!EnergyPolicy.shouldPoll(foreground, webSocketConnected, bridgeSelected)) {
+                return;
+            }
+            if (pollInFlight.compareAndSet(false, true)) {
                 pollCurrentState(activeHost, activePort);
             }
-            handler.postDelayed(this, POLL_INTERVAL_MS);
+            if (EnergyPolicy.shouldPoll(foreground, webSocketConnected, bridgeSelected)) {
+                handler.postDelayed(this, POLL_INTERVAL_MS);
+            }
         }
     };
 
@@ -77,11 +95,9 @@ public class MainActivity extends Activity {
                 .readTimeout(4, TimeUnit.SECONDS)
                 .build();
         nsdManager = (NsdManager) getSystemService(Context.NSD_SERVICE);
-        acquireMulticastLock();
 
-        haloView.setStatus("SEARCHING", "Searching...");
-        Log.i(TAG, "app started; searching for Bridge");
-        trySavedHostThenDiscover();
+        updateDisplayStatus("SEARCHING", "Searching...");
+        Log.i(TAG, "app created");
     }
 
     private void enterImmersiveMode() {
@@ -96,10 +112,13 @@ public class MainActivity extends Activity {
     }
 
     private void acquireMulticastLock() {
+        if (multicastLock != null && multicastLock.isHeld()) return;
         WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wifi != null) {
-            multicastLock = wifi.createMulticastLock("HaloLink-mdns");
-            multicastLock.setReferenceCounted(false);
+            if (multicastLock == null) {
+                multicastLock = wifi.createMulticastLock("HaloLink-mdns");
+                multicastLock.setReferenceCounted(false);
+            }
             try {
                 multicastLock.acquire();
                 Log.i(TAG, "multicast lock acquired");
@@ -109,7 +128,19 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void releaseMulticastLock() {
+        if (multicastLock != null && multicastLock.isHeld()) {
+            try {
+                multicastLock.release();
+                Log.i(TAG, "multicast lock released");
+            } catch (RuntimeException error) {
+                Log.w(TAG, "multicast lock release failed", error);
+            }
+        }
+    }
+
     private void trySavedHostThenDiscover() {
+        if (!isActive()) return;
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         String host = prefs.getString("host", "");
         int port = prefs.getInt("port", PORT_START);
@@ -123,57 +154,79 @@ public class MainActivity extends Activity {
     }
 
     private synchronized void startDiscovery() {
-        if (destroyed || discoveryRunning || nsdManager == null) return;
-        runOnUiThread(() -> haloView.setStatus("SEARCHING", "Searching..."));
+        if (!isActive() || discoveryRunning || nsdManager == null) return;
+        acquireMulticastLock();
+        updateDisplayStatus("SEARCHING", "Searching...");
+        int generation = scanGeneration;
         discoveryListener = new NsdManager.DiscoveryListener() {
+            private boolean isCurrent() {
+                return discoveryListener == this && generation == scanGeneration;
+            }
+
             @Override public void onDiscoveryStarted(String regType) {
+                if (!isCurrent()) return;
                 discoveryRunning = true;
                 Log.i(TAG, "mDNS discovery started type=" + regType);
             }
             @Override public void onServiceFound(NsdServiceInfo service) {
+                if (!isCurrent()) return;
                 String name = service.getServiceName() == null ? "" : service.getServiceName();
                 Log.i(TAG, "mDNS service found name=" + name);
                 if (name.startsWith("HaloLink") && resolving.compareAndSet(false, true)) {
-                    resolveService(service);
+                    resolveService(service, generation);
                 }
             }
             @Override public void onServiceLost(NsdServiceInfo service) {
+                if (!isCurrent()) return;
                 Log.w(TAG, "mDNS service lost name=" + service.getServiceName());
             }
             @Override public void onDiscoveryStopped(String serviceType) {
+                if (!isCurrent()) return;
                 discoveryRunning = false;
+                discoveryListener = null;
+                releaseMulticastLock();
                 Log.i(TAG, "mDNS discovery stopped type=" + serviceType);
             }
             @Override public void onStartDiscoveryFailed(String serviceType, int errorCode) {
+                if (!isCurrent()) return;
                 discoveryRunning = false;
                 Log.e(TAG, "mDNS discovery start failed code=" + errorCode);
                 safeStopDiscovery();
                 scheduleDiscoveryRetry();
             }
             @Override public void onStopDiscoveryFailed(String serviceType, int errorCode) {
+                if (!isCurrent()) return;
                 discoveryRunning = false;
+                discoveryListener = null;
+                releaseMulticastLock();
                 Log.e(TAG, "mDNS discovery stop failed code=" + errorCode);
             }
         };
         try {
+            discoveryRunning = true;
             nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener);
         } catch (RuntimeException error) {
             discoveryRunning = false;
+            discoveryListener = null;
+            releaseMulticastLock();
             Log.e(TAG, "mDNS discovery threw exception", error);
             scheduleDiscoveryRetry();
         }
     }
 
     @SuppressWarnings("deprecation")
-    private void resolveService(NsdServiceInfo service) {
+    private void resolveService(NsdServiceInfo service, int generation) {
         try {
             nsdManager.resolveService(service, new NsdManager.ResolveListener() {
                 @Override public void onResolveFailed(NsdServiceInfo serviceInfo, int errorCode) {
                     resolving.set(false);
+                    if (generation != scanGeneration) return;
                     Log.e(TAG, "mDNS resolve failed code=" + errorCode);
+                    if (isActive()) scheduleDiscoveryRetry();
                 }
                 @Override public void onServiceResolved(NsdServiceInfo serviceInfo) {
                     resolving.set(false);
+                    if (!isActive() || generation != scanGeneration) return;
                     InetAddress host = serviceInfo.getHost();
                     if (host == null) {
                         Log.e(TAG, "mDNS resolved without host");
@@ -195,13 +248,14 @@ public class MainActivity extends Activity {
     }
 
     private void scanForBridge(String host, int preferredPort, boolean fallBackToDiscovery) {
+        if (!isActive()) return;
         int generation = ++scanGeneration;
         Log.i(
                 TAG,
                 "scanning host=" + host + " preferredPort=" + preferredPort
                         + " generation=" + generation
         );
-        runOnUiThread(() -> haloView.setStatus("SEARCHING", "Finding Bridge..."));
+        updateDisplayStatus("SEARCHING", "Finding Bridge...");
         int firstPort = preferredPort >= PORT_START && preferredPort <= PORT_END
                 ? preferredPort : PORT_START;
         probePort(host, firstPort, generation, fallBackToDiscovery, true);
@@ -214,7 +268,7 @@ public class MainActivity extends Activity {
             boolean fallBackToDiscovery,
             boolean preferredAttempt
     ) {
-        if (destroyed || generation != scanGeneration) return;
+        if (!isActive() || generation != scanGeneration) return;
         if (port > PORT_END) {
             Log.w(TAG, "no verified Bridge on host=" + host);
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
@@ -258,7 +312,7 @@ public class MainActivity extends Activity {
                     Log.w(TAG, "health response parse failed " + host + ":" + port, error);
                 }
 
-                if (destroyed || generation != scanGeneration) return;
+                if (!isActive() || generation != scanGeneration) return;
                 if (verified) {
                     Log.i(
                             TAG,
@@ -291,7 +345,7 @@ public class MainActivity extends Activity {
     }
 
     private synchronized void connectWebSocket(String host, int port) {
-        if (destroyed) return;
+        if (!isActive()) return;
         if (reconnectRunnable != null) {
             handler.removeCallbacks(reconnectRunnable);
             reconnectRunnable = null;
@@ -299,8 +353,8 @@ public class MainActivity extends Activity {
         closeSocket();
         activeHost = host;
         activePort = port;
-        runOnUiThread(() -> haloView.setStatus("CONNECTING", "Connecting..."));
-        startPolling();
+        updateDisplayStatus("CONNECTING", "Connecting...");
+        startFallbackPolling();
 
         String url = "ws://" + safeHost(host) + ":" + port + "/ws/phone";
         Log.i(TAG, "WebSocket connecting url=" + url);
@@ -308,16 +362,19 @@ public class MainActivity extends Activity {
         WebSocket candidate = httpClient.newWebSocket(request, new WebSocketListener() {
             @Override public void onOpen(WebSocket socket, Response response) {
                 synchronized (MainActivity.this) {
-                    if (destroyed || webSocket != socket) {
+                    if (!isActive() || webSocket != socket) {
                         socket.close(1000, "Superseded");
                         Log.i(TAG, "ignoring superseded WebSocket open");
                         return;
                     }
+                    webSocketConnected = true;
                 }
+                stopFallbackPolling();
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                         .putString("host", host).putInt("port", port).apply();
-                runOnUiThread(() -> haloView.setStatus("READY", "Ready"));
+                updateDisplayStatus("READY", "Ready");
                 Log.i(TAG, "WebSocket opened host=" + host + " port=" + port);
+                Log.i(TAG, "HTTP fallback polling stopped; WebSocket is healthy");
                 socket.send(
                         "{\"type\":\"hello\",\"role\":\"android\",\"version\":\""
                                 + APP_VERSION + "\"}"
@@ -325,6 +382,9 @@ public class MainActivity extends Activity {
             }
 
             @Override public void onMessage(WebSocket socket, String text) {
+                synchronized (MainActivity.this) {
+                    if (!isActive() || webSocket != socket || !webSocketConnected) return;
+                }
                 Log.i(TAG, "WebSocket message received");
                 applyStatusPayload(text, false);
             }
@@ -338,17 +398,26 @@ public class MainActivity extends Activity {
                 boolean current;
                 synchronized (MainActivity.this) {
                     current = webSocket == socket;
-                    if (current) webSocket = null;
+                    if (current) {
+                        webSocket = null;
+                        webSocketConnected = false;
+                    }
                 }
                 Log.w(TAG, "WebSocket closed code=" + code + " reason=" + reason);
-                if (current) scheduleReconnect(host);
+                if (current && isActive()) {
+                    startFallbackPolling();
+                    scheduleReconnect(host);
+                }
             }
 
             @Override public void onFailure(WebSocket socket, Throwable error, Response response) {
                 boolean current;
                 synchronized (MainActivity.this) {
                     current = webSocket == socket;
-                    if (current) webSocket = null;
+                    if (current) {
+                        webSocket = null;
+                        webSocketConnected = false;
+                    }
                 }
                 int status = response == null ? 0 : response.code();
                 Log.e(
@@ -357,7 +426,10 @@ public class MainActivity extends Activity {
                                 + " httpStatus=" + status,
                         error
                 );
-                if (current) scheduleReconnect(host);
+                if (current && isActive()) {
+                    startFallbackPolling();
+                    scheduleReconnect(host);
+                }
             }
         });
         webSocket = candidate;
@@ -375,15 +447,22 @@ public class MainActivity extends Activity {
             String label = status.optString("label", state);
             Log.i(TAG, "state received and applied state=" + state + " source="
                     + (nestedState ? "http-poll" : "websocket"));
-            runOnUiThread(() -> haloView.setStatus(state, label));
+            if (isActive()) updateDisplayStatus(state, label);
         } catch (Exception error) {
             Log.w(TAG, "status payload parse failed", error);
         }
     }
 
-    private void startPolling() {
+    private void startFallbackPolling() {
+        boolean bridgeSelected = !activeHost.isEmpty() && activePort > 0;
+        if (!EnergyPolicy.shouldPoll(foreground, webSocketConnected, bridgeSelected)) return;
         handler.removeCallbacks(pollRunnable);
         handler.post(pollRunnable);
+        Log.i(TAG, "HTTP fallback polling started; WebSocket is unavailable");
+    }
+
+    private void stopFallbackPolling() {
+        handler.removeCallbacks(pollRunnable);
     }
 
     private void pollCurrentState(String host, int port) {
@@ -391,6 +470,7 @@ public class MainActivity extends Activity {
         Request request = new Request.Builder().url(url).build();
         httpClient.newCall(request).enqueue(new Callback() {
             @Override public void onFailure(Call call, IOException error) {
+                pollInFlight.set(false);
                 Log.w(TAG, "HTTP polling failed host=" + host + " port=" + port
                         + " error=" + error);
             }
@@ -402,21 +482,24 @@ public class MainActivity extends Activity {
                         return;
                     }
                     String text = response.body().string();
-                    if (!host.equals(activeHost) || port != activePort) return;
+                    if (!isActive() || webSocketConnected
+                            || !host.equals(activeHost) || port != activePort) return;
                     Log.i(TAG, "HTTP polling success host=" + host + " port=" + port);
                     applyStatusPayload(text, true);
                 } catch (Exception error) {
                     Log.w(TAG, "HTTP polling response failed", error);
+                } finally {
+                    pollInFlight.set(false);
                 }
             }
         });
     }
 
     private synchronized void scheduleReconnect(String host) {
-        if (destroyed) return;
+        if (!isActive()) return;
         if (reconnectRunnable != null) handler.removeCallbacks(reconnectRunnable);
         Log.i(TAG, "reconnect scheduled host=" + host + " delayMs=1800");
-        runOnUiThread(() -> haloView.setStatus("SEARCHING", "Reconnecting..."));
+        updateDisplayStatus("SEARCHING", "Reconnecting...");
         int port = activePort;
         reconnectRunnable = () -> {
             synchronized (MainActivity.this) {
@@ -428,22 +511,75 @@ public class MainActivity extends Activity {
     }
 
     private void scheduleDiscoveryRetry() {
-        if (!destroyed) {
+        if (isActive()) {
             Log.i(TAG, "mDNS discovery retry scheduled delayMs=2500");
             handler.postDelayed(this::startDiscovery, 2500);
         }
     }
 
     private synchronized void safeStopDiscovery() {
-        if (!discoveryRunning || discoveryListener == null || nsdManager == null) return;
-        try { nsdManager.stopServiceDiscovery(discoveryListener); } catch (RuntimeException ignored) { }
+        if (discoveryRunning && discoveryListener != null && nsdManager != null) {
+            try {
+                nsdManager.stopServiceDiscovery(discoveryListener);
+            } catch (RuntimeException ignored) { }
+        }
         discoveryRunning = false;
+        discoveryListener = null;
+        resolving.set(false);
+        releaseMulticastLock();
     }
 
     private synchronized void closeSocket() {
         WebSocket socket = webSocket;
         webSocket = null;
+        webSocketConnected = false;
         if (socket != null) socket.close(1000, "Reconnect");
+    }
+
+    private boolean isActive() {
+        return foreground && !destroyed;
+    }
+
+    private void updateDisplayStatus(String state, String label) {
+        runOnUiThread(() -> {
+            if (destroyed || haloView == null) return;
+            if (!haloView.setStatus(state, label)) return;
+            handler.removeCallbacks(idleDimRunnable);
+            setWindowBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE);
+            if (foreground && EnergyPolicy.isIdleState(state)) {
+                handler.postDelayed(idleDimRunnable, IDLE_DIM_DELAY_MS);
+            }
+        });
+    }
+
+    private float idleBrightness() {
+        try {
+            int systemBrightness = Settings.System.getInt(
+                    getContentResolver(),
+                    Settings.System.SCREEN_BRIGHTNESS
+            );
+            float normalized = Math.max(0f, Math.min(1f, systemBrightness / 255f));
+            return Math.min(MAX_IDLE_BRIGHTNESS, normalized);
+        } catch (Settings.SettingNotFoundException ignored) {
+            return MAX_IDLE_BRIGHTNESS;
+        }
+    }
+
+    private void setWindowBrightness(float brightness) {
+        WindowManager.LayoutParams attributes = getWindow().getAttributes();
+        if (Math.abs(attributes.screenBrightness - brightness) < 0.001f) return;
+        attributes.screenBrightness = brightness;
+        getWindow().setAttributes(attributes);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        foreground = true;
+        haloView.setAnimationsEnabled(true);
+        updateDisplayStatus("SEARCHING", "Searching...");
+        Log.i(TAG, "app entered foreground; Bridge connection enabled");
+        trySavedHostThenDiscover();
     }
 
     @Override
@@ -453,15 +589,37 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onStop() {
+        foreground = false;
+        ++scanGeneration;
+        if (reconnectRunnable != null) {
+            handler.removeCallbacks(reconnectRunnable);
+            reconnectRunnable = null;
+        }
+        handler.removeCallbacks(idleDimRunnable);
+        stopFallbackPolling();
+        safeStopDiscovery();
+        closeSocket();
+        haloView.setAnimationsEnabled(false);
+        setWindowBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE);
+        Log.i(TAG, "app left foreground; network, discovery, polling, and animation paused");
+        super.onStop();
+    }
+
+    @Override
     protected void onDestroy() {
         destroyed = true;
+        foreground = false;
         ++scanGeneration;
         reconnectRunnable = null;
+        stopFallbackPolling();
         safeStopDiscovery();
         closeSocket();
         handler.removeCallbacksAndMessages(null);
         if (httpClient != null) httpClient.dispatcher().executorService().shutdown();
-        if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
+        releaseMulticastLock();
+        if (haloView != null) haloView.setAnimationsEnabled(false);
+        setWindowBrightness(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE);
         super.onDestroy();
     }
 }

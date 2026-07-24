@@ -1,8 +1,8 @@
-HALOLINK v0.1.5 — START HERE
+HALOLINK v0.1.6 — START HERE
 
 1. Mac: double-click mac-bridge/run_bridge.command
 2. Chrome: chrome://extensions -> Developer mode -> Load unpacked -> choose chrome-extension
-3. Android: install apk/HaloLink-v0.1.5-debug.apk and open HaloLink on the same Wi-Fi
+3. Android: install apk/HaloLink-v0.1.6-debug.apk and open HaloLink on the same Wi-Fi
 4. Confirm http://MAC_IP:PORT/health reports product=HaloLink and phoneClients=1
 5. Test animations: double-click mac-bridge/demo_states.command
 

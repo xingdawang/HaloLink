@@ -7,20 +7,28 @@
 const ring=document.getElementById('ring'),label=document.getElementById('label'),sub=document.getElementById('sub'),icon=document.getElementById('icon');
 const states={READY:['#46be64','Ready','Connected',''],THINKING:['#ff4646','Thinking...','ChatGPT is thinking',''],WORKING:['#ff8b33','Working...','A tool is running',''],STREAMING:['#ff5546','Responding...','Response in progress',''],LISTENING:['#3f9cff','Listening...','Voice input active','≋'],COMPLETED:['#4ae868','Completed!','Response ready','✓'],ERROR:['#d552eb','Error','Check the browser','!'],SEARCHING:['#bec6d0','Searching...','Looking for your Mac',''],CONNECTING:['#bec6d0','Connecting...','Local network','']};
 function show(s,l){s=(s||'READY').toUpperCase();const v=states[s]||states.READY;document.documentElement.style.setProperty('--c',v[0]);label.textContent=l||v[1];sub.textContent=v[2];icon.textContent=v[3];ring.className='ring '+(['WORKING','STREAMING','SEARCHING','CONNECTING'].includes(s)?'rotating':(['THINKING','LISTENING'].includes(s)?'pulse':s==='ERROR'?'flash':''));}
-let retry=800,wsConnected=false,lastTimestamp='';
+let retry=800,wsConnected=false,lastTimestamp='',socket=null,pollTimer=null,reconnectTimer=null;
 function applyStatus(j){if(!j||j.type!=='status')return;if(j.timestamp&&lastTimestamp&&j.timestamp<lastTimestamp)return;lastTimestamp=j.timestamp||lastTimestamp;show(j.state,j.label);}
 async function pollState(){
-  if(wsConnected)return;
+  if(wsConnected||document.hidden)return;
   try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);const j=await r.json();applyStatus(j.state);}
   catch{show('CONNECTING');}
 }
+function startPolling(){if(pollTimer||wsConnected||document.hidden)return;pollState();pollTimer=setInterval(pollState,1500);}
+function stopPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}
+function scheduleReconnect(){clearTimeout(reconnectTimer);if(!document.hidden)reconnectTimer=setTimeout(connect,retry=Math.min(retry*1.5,7000));}
 function connect(){
-  const scheme=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${scheme}://${location.host}/ws/phone`);
-  ws.onopen=()=>{wsConnected=true;retry=800;sub.textContent='Live connection';};
-  ws.onmessage=e=>{try{applyStatus(JSON.parse(e.data))}catch{}};
-  ws.onclose=()=>{wsConnected=false;pollState();setTimeout(connect,retry=Math.min(retry*1.5,7000));};
-  ws.onerror=()=>ws.close();
+  if(document.hidden||socket?.readyState===WebSocket.OPEN||socket?.readyState===WebSocket.CONNECTING)return;
+  const scheme=location.protocol==='https:'?'wss':'ws',candidate=new WebSocket(`${scheme}://${location.host}/ws/phone`);socket=candidate;
+  candidate.onopen=()=>{if(socket!==candidate)return;wsConnected=true;retry=800;stopPolling();sub.textContent='Live connection';};
+  candidate.onmessage=e=>{if(socket!==candidate)return;try{applyStatus(JSON.parse(e.data))}catch{}};
+  candidate.onclose=()=>{if(socket!==candidate)return;socket=null;wsConnected=false;startPolling();scheduleReconnect();};
+  candidate.onerror=()=>candidate.close();
 }
-pollState();setInterval(pollState,1500);connect();
-document.addEventListener('click',()=>document.documentElement.requestFullscreen?.());
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden){clearTimeout(reconnectTimer);stopPolling();socket?.close();}
+  else{startPolling();connect();}
+});
+startPolling();connect();
+	document.addEventListener('click',()=>document.documentElement.requestFullscreen?.());
 </script></body></html>

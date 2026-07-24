@@ -10,25 +10,51 @@ import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.SweepGradient;
 import android.graphics.Typeface;
+import android.os.Build;
 import android.view.View;
 import android.view.animation.LinearInterpolator;
 
 import java.util.Locale;
 
 public class HaloView extends View {
+    private static final long OLED_SHIFT_INTERVAL_MS = 120_000L;
+    private static final float[] SWEEP_POSITIONS = {0f, .35f, .72f, 1f};
+
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint subTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path checkPath = new Path();
+    private final RectF ringOval = new RectF();
+    private final int[] sweepColors = new int[4];
     private final ValueAnimator animator;
+    private BlurMaskFilter glowFilter;
+    private SweepGradient sweepGradient;
+    private float cachedStroke = -1f;
+    private float cachedCenterX = Float.NaN;
+    private float cachedCenterY = Float.NaN;
+    private int cachedGradientColor = Color.TRANSPARENT;
     private String state = "SEARCHING";
     private String label = "Searching...";
     private float phase = 0f;
-    private long statusChangedAt = System.currentTimeMillis();
+    private boolean animationsEnabled = true;
+    private boolean attached = false;
+
+    private final Runnable oledShiftRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!attached || !animationsEnabled || EnergyPolicy.isAnimatedState(state)) return;
+            invalidate();
+            postDelayed(this, OLED_SHIFT_INTERVAL_MS);
+        }
+    };
 
     public HaloView(Context context) {
         super(context);
-        setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+        // BlurMaskFilter is hardware accelerated on the Mate 20 Pro/API 29.
+        // Keep the compatibility fallback only for Android 8.x devices.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            setLayerType(View.LAYER_TYPE_SOFTWARE, null);
+        }
         setBackgroundColor(Color.BLACK);
         textPaint.setColor(Color.WHITE);
         textPaint.setTextAlign(Paint.Align.CENTER);
@@ -44,15 +70,41 @@ public class HaloView extends View {
             phase = (float) value.getAnimatedValue();
             invalidate();
         });
-        animator.start();
     }
 
-    public void setStatus(String newState, String newLabel) {
+    public boolean setStatus(String newState, String newLabel) {
         String normalized = newState == null ? "READY" : newState.toUpperCase(Locale.ROOT);
-        if (!normalized.equals(state)) statusChangedAt = System.currentTimeMillis();
+        String resolvedLabel = newLabel == null || newLabel.isEmpty()
+                ? defaultLabel(normalized) : newLabel;
+        if (normalized.equals(state) && resolvedLabel.equals(label)) return false;
         state = normalized;
-        label = newLabel == null || newLabel.isEmpty() ? defaultLabel(normalized) : newLabel;
+        label = resolvedLabel;
+        updateAnimationPolicy();
         invalidate();
+        return true;
+    }
+
+    public String getState() {
+        return state;
+    }
+
+    public void setAnimationsEnabled(boolean enabled) {
+        if (animationsEnabled == enabled) return;
+        animationsEnabled = enabled;
+        updateAnimationPolicy();
+    }
+
+    private void updateAnimationPolicy() {
+        removeCallbacks(oledShiftRunnable);
+        boolean shouldAnimate = attached && animationsEnabled && EnergyPolicy.isAnimatedState(state);
+        if (shouldAnimate) {
+            if (!animator.isStarted()) animator.start();
+        } else {
+            if (animator.isStarted()) animator.cancel();
+            if (attached && animationsEnabled) {
+                postDelayed(oledShiftRunnable, OLED_SHIFT_INTERVAL_MS);
+            }
+        }
     }
 
     private String defaultLabel(String value) {
@@ -90,16 +142,19 @@ public class HaloView extends View {
         float h = getHeight();
         float min = Math.min(w, h);
 
-        // Tiny, slow movement reduces prolonged OLED pixel stress while remaining invisible in normal use.
-        double burnPhase = System.currentTimeMillis() / 120000.0;
+        // Shift only once per interval. Static states redraw on the same cadence,
+        // while animated states reuse one cached gradient between shifts.
+        long burnStep = System.currentTimeMillis() / OLED_SHIFT_INTERVAL_MS;
+        double burnPhase = burnStep * 0.91;
         float burnX = (float) Math.sin(burnPhase) * 3f;
         float burnY = (float) Math.cos(burnPhase * 0.83) * 3f;
         float cx = w / 2f + burnX;
         float cy = h / 2f + burnY;
         float radius = min * 0.31f;
         float stroke = Math.max(10f, min * 0.022f);
-        RectF oval = new RectF(cx - radius, cy - radius, cx + radius, cy + radius);
+        ringOval.set(cx - radius, cy - radius, cx + radius, cy + radius);
         int color = colorForState();
+        updateEffectCache(cx, cy, stroke, color);
 
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(stroke);
@@ -109,7 +164,7 @@ public class HaloView extends View {
 
         // Dim base ring.
         paint.setColor(withAlpha(color, state.equals("READY") ? 95 : 55));
-        canvas.drawOval(oval, paint);
+        canvas.drawOval(ringOval, paint);
 
         float pulse = 0.64f + 0.36f * (float) Math.sin(phase * Math.PI * 2);
         float rotation = phase * 360f - 90f;
@@ -119,27 +174,25 @@ public class HaloView extends View {
         if (state.equals("READY")) brightAlpha = 75;
 
         paint.setColor(withAlpha(color, brightAlpha));
-        paint.setMaskFilter(new BlurMaskFilter(stroke * 1.2f, BlurMaskFilter.Blur.NORMAL));
+        paint.setMaskFilter(glowFilter);
         if (isRotating()) {
-            paint.setShader(new SweepGradient(cx, cy,
-                    new int[]{Color.TRANSPARENT, withAlpha(color, 110), color, Color.TRANSPARENT},
-                    new float[]{0f, .35f, .72f, 1f}));
+            paint.setShader(sweepGradient);
             canvas.save();
             canvas.rotate(rotation, cx, cy);
-            canvas.drawArc(oval, 0, 125, false, paint);
+            canvas.drawArc(ringOval, 0, 125, false, paint);
             canvas.restore();
             paint.setShader(null);
         } else {
-            canvas.drawOval(oval, paint);
+            canvas.drawOval(ringOval, paint);
         }
 
         paint.setMaskFilter(null);
         paint.setStrokeWidth(Math.max(5f, stroke * .48f));
         paint.setColor(withAlpha(color, 245));
         if (isRotating()) {
-            canvas.drawArc(oval, rotation, 82, false, paint);
+            canvas.drawArc(ringOval, rotation, 82, false, paint);
         } else {
-            canvas.drawOval(oval, paint);
+            canvas.drawOval(ringOval, paint);
         }
 
         if (state.equals("LISTENING")) drawListeningWaves(canvas, cx, cy - radius * .18f, color, stroke);
@@ -153,6 +206,26 @@ public class HaloView extends View {
         subTextPaint.setTextSize(Math.max(18f, min * 0.037f));
         String sub = subLabel();
         if (!sub.isEmpty()) canvas.drawText(sub, cx, textY + min * .075f, subTextPaint);
+    }
+
+    private void updateEffectCache(float cx, float cy, float stroke, int color) {
+        if (Math.abs(cachedStroke - stroke) > 0.01f || glowFilter == null) {
+            cachedStroke = stroke;
+            glowFilter = new BlurMaskFilter(stroke * 1.2f, BlurMaskFilter.Blur.NORMAL);
+        }
+        if (sweepGradient == null
+                || cachedGradientColor != color
+                || Math.abs(cachedCenterX - cx) > 0.01f
+                || Math.abs(cachedCenterY - cy) > 0.01f) {
+            cachedCenterX = cx;
+            cachedCenterY = cy;
+            cachedGradientColor = color;
+            sweepColors[0] = Color.TRANSPARENT;
+            sweepColors[1] = withAlpha(color, 110);
+            sweepColors[2] = color;
+            sweepColors[3] = Color.TRANSPARENT;
+            sweepGradient = new SweepGradient(cx, cy, sweepColors, SWEEP_POSITIONS);
+        }
     }
 
     private boolean isRotating() {
@@ -219,8 +292,17 @@ public class HaloView extends View {
     }
 
     @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        attached = true;
+        updateAnimationPolicy();
+    }
+
+    @Override
     protected void onDetachedFromWindow() {
-        animator.cancel();
+        attached = false;
+        removeCallbacks(oledShiftRunnable);
+        if (animator.isStarted()) animator.cancel();
         super.onDetachedFromWindow();
     }
 }

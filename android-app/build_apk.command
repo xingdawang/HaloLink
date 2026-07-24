@@ -10,5 +10,6 @@ if [ -z "$ANDROID_HOME" ]; then
 fi
 ./gradlew assembleDebug
 mkdir -p ../apk
-cp app/build/outputs/apk/debug/app-debug.apk ../apk/HaloLink-v0.1-debug.apk
-echo "APK created: ../apk/HaloLink-v0.1-debug.apk"
+cp app/build/outputs/apk/debug/app-debug.apk ../apk/HaloLink-v0.1.6-debug.apk
+(cd ../apk && shasum -a 256 HaloLink-v0.1.6-debug.apk > HaloLink-v0.1.6-debug.apk.sha256)
+echo "APK created: ../apk/HaloLink-v0.1.6-debug.apk"
